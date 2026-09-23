@@ -31,6 +31,7 @@ func ConfigureFromEnv() {
 	downstreamWSKeepaliveInterval = downstreamWSKeepaliveIntervalFromEnv()
 	ConfigureStreamFakeThinkingFromEnv()
 	ConfigureUpstreamErrorRewriteFromEnv()
+	ConfigureDispatchWaitFromEnv()
 }
 
 // startDownstreamSSEKeepalive 周期执行 writeKeepalive，直到请求取消、写失败

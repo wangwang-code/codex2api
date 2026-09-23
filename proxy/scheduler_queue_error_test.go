@@ -32,6 +32,58 @@ func parkSchedulerWaiterAccount(t *testing.T, store *auth.Store) *auth.Account {
 	return account
 }
 
+// TestDispatchWaitTimeoutZeroFailsImmediately 验证把等待上限设为 0 后，池里账号都在
+// 冷却（结构可服务、但没有任何可立刻派发的账号）时也会立即失败，而不是等满超时。
+//
+// 这正是「索引调度 + 顺序耗尽」下账号全部限流/耗尽时的期望行为：索引调度默认会排队
+// 等容量，而 CPA 没有等待队列、立刻报错。等待上限设 0 即在索引调度下对齐 CPA。
+func TestDispatchWaitTimeoutZeroFailsImmediately(t *testing.T) {
+	previous := dispatchAccountWaitTimeout
+	dispatchAccountWaitTimeout = 0
+	t.Cleanup(func() { dispatchAccountWaitTimeout = previous })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
+	t.Cleanup(store.Stop)
+	parkSchedulerWaiterAccount(t, store)
+	h := &Handler{store: store}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	started := time.Now()
+	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.DispatchPolicyStandard)
+	elapsed := time.Since(started)
+
+	if account != nil || err != nil {
+		t.Fatalf("selection returned account=%v, error=%v", account, err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("等待上限为 0 时仍等了 %s，应当立即失败", elapsed)
+	}
+	if got := store.GetSchedulerMetrics().Waiters; got != 0 {
+		t.Fatalf("不应进入等待队列，leaked %d queue waiters", got)
+	}
+}
+
+// TestDispatchWaitTimeoutEnvOverride 验证等待上限可由环境变量配置，且 0 是合法值。
+func TestDispatchWaitTimeoutEnvOverride(t *testing.T) {
+	t.Setenv("DISPATCH_ACCOUNT_WAIT_TIMEOUT", "")
+	if got := dispatchAccountWaitTimeoutFromEnv(); got != defaultDispatchAccountWaitTimeout {
+		t.Fatalf("默认 = %s, want %s", got, defaultDispatchAccountWaitTimeout)
+	}
+	t.Setenv("DISPATCH_ACCOUNT_WAIT_TIMEOUT", "0")
+	if got := dispatchAccountWaitTimeoutFromEnv(); got != 0 {
+		t.Fatalf("0 应当表示不等待，got %s", got)
+	}
+	t.Setenv("DISPATCH_ACCOUNT_WAIT_TIMEOUT", "1s")
+	if got := dispatchAccountWaitTimeoutFromEnv(); got != time.Second {
+		t.Fatalf("1s => %s", got)
+	}
+	t.Setenv("DISPATCH_ACCOUNT_WAIT_TIMEOUT", "later")
+	if got := dispatchAccountWaitTimeoutFromEnv(); got != defaultDispatchAccountWaitTimeout {
+		t.Fatalf("非法值应沿用默认，got %s", got)
+	}
+}
+
 func saturatedSchedulerQueue(t *testing.T) *auth.Store {
 	t.Helper()
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})

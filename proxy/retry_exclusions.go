@@ -416,9 +416,28 @@ func waitForContinuousPoolRetry(ctx context.Context) bool {
 	}
 }
 
-// dispatchAccountWaitTimeout is one queue admission. Tests shorten it so a
-// saturated pool can fail without sleeping the production interval.
-var dispatchAccountWaitTimeout = 30 * time.Second
+// defaultDispatchAccountWaitTimeout 是一次调度队列准入的默认等待上限。
+const defaultDispatchAccountWaitTimeout = 30 * time.Second
+
+// dispatchAccountWaitTimeout 是一次队列准入的等待上限。
+//
+// 默认 30s（索引调度引擎会在这段时间里等一个空闲槽位/冷却解除）。设 0 表示不排队
+// 等待：池内没有可立刻派发的账号时立即失败，与 CPA「没有可用账号就立刻报错」一致，
+// 也避免客户端被挂满超时。注意它只影响等待上限，不影响账号选择顺序——「优先选哪个
+// 账号」由调度模式（轮询/剩余配额/顺序耗尽）决定。
+//
+// 由 DISPATCH_ACCOUNT_WAIT_TIMEOUT 配置（Go duration）；测试会直接改这个变量。
+var dispatchAccountWaitTimeout = dispatchAccountWaitTimeoutFromEnv()
+
+// dispatchAccountWaitTimeoutFromEnv 读取调度等待上限配置。
+func dispatchAccountWaitTimeoutFromEnv() time.Duration {
+	return durationFromEnv("DISPATCH_ACCOUNT_WAIT_TIMEOUT", defaultDispatchAccountWaitTimeout)
+}
+
+// ConfigureDispatchWaitFromEnv 在 config.Load 读取 .env 后刷新调度等待上限。
+func ConfigureDispatchWaitFromEnv() {
+	dispatchAccountWaitTimeout = dispatchAccountWaitTimeoutFromEnv()
+}
 
 // waitForRetryAccountAvailable keeps one queue admission for the normal
 // 30-second wait, including continuous-retry SSE/WebSocket heartbeats.
