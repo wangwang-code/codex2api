@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -36,13 +38,15 @@ var (
 	notifyHTTPClient    = &http.Client{Timeout: defaultNotifyTimeout}
 )
 
-// notifyWebhookFormatFromEnv 读取 webhook 载荷格式，决定 body 形状：
+// notifyWebhookFormatFromEnv 读取 webhook 载荷格式，决定请求形状：
 //
-//	json（默认）: {"text": "..."}
-//	text       : 纯文本 body
-//	wecom      : 企业微信群机器人 {"msgtype":"text","text":{"content":"..."}}
-//	feishu     : 飞书自定义机器人 {"msg_type":"text","content":{"text":"..."}}
-//	dingtalk   : 钉钉自定义机器人 {"msgtype":"text","text":{"content":"..."}}
+//	telegram   GET <url>&text=<urlencoded message>（Telegram Bot API sendMessage 这种
+//	           查询串拼接；别名 tg / query）
+//	json（默认）POST {"text": "..."}
+//	text       POST 纯文本 body
+//	wecom      POST 企业微信群机器人 {"msgtype":"text","text":{"content":"..."}}
+//	feishu     POST 飞书自定义机器人 {"msg_type":"text","content":{"text":"..."}}
+//	dingtalk   POST 钉钉自定义机器人 {"msgtype":"text","text":{"content":"..."}}
 func notifyWebhookFormatFromEnv() string {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("NOTIFY_WEBHOOK_FORMAT")))
 	switch raw {
@@ -50,11 +54,16 @@ func notifyWebhookFormatFromEnv() string {
 		return "json"
 	case "text", "wecom", "feishu", "dingtalk":
 		return raw
+	case "telegram", "tg", "query":
+		return notifyFormatTelegram
 	default:
 		log.Printf("[Config] NOTIFY_WEBHOOK_FORMAT=%q 非法，沿用默认 json", raw)
 		return "json"
 	}
 }
+
+// notifyFormatTelegram 是查询串拼接格式：消息进 URL 而不是 body。
+const notifyFormatTelegram = "telegram"
 
 // ConfigureNotifyFromEnv 在 config.Load 读取 .env 后刷新通知配置。
 func ConfigureNotifyFromEnv() {
@@ -66,8 +75,11 @@ func notifyEnabled() bool {
 	return notifyWebhookURL != ""
 }
 
-// notifyPayload 按配置的格式生成 webhook 请求体。
+// notifyPayload 按配置的格式生成 webhook 请求体（查询串格式的 body 为空）。
 func notifyPayload(message string) []byte {
+	if notifyWebhookFormat == notifyFormatTelegram {
+		return nil
+	}
 	var body []byte
 	switch notifyWebhookFormat {
 	case "text":
@@ -82,16 +94,49 @@ func notifyPayload(message string) []byte {
 	return body
 }
 
+// notifyRequest 按配置的格式生成最终请求：方法、目标 URL、body。
+func notifyRequest(message string) (string, string, []byte) {
+	if notifyWebhookFormat == notifyFormatTelegram {
+		return http.MethodGet, appendNotifyQuery(notifyWebhookURL, message), nil
+	}
+	return http.MethodPost, notifyWebhookURL, notifyPayload(message)
+}
+
+// appendNotifyQuery 把 text=<urlencoded> 拼到配置的 URL 上。
+// 已有查询串用 `&` 续接，否则用 `?`；片段（#...）保持在其后。
+func appendNotifyQuery(rawURL, message string) string {
+	separator := "?"
+	if strings.Contains(rawURL, "?") {
+		separator = "&"
+	}
+	param := "text=" + url.QueryEscape(message)
+	if index := strings.Index(rawURL, "#"); index >= 0 {
+		return rawURL[:index] + separator + param + rawURL[index:]
+	}
+	return rawURL + separator + param
+}
+
 // sendNotification 异步投递一条通知。未配置 webhook 时直接返回。
 func sendNotification(event, message string) {
 	if !notifyEnabled() {
 		return
 	}
-	url := notifyWebhookURL
-	payload := notifyPayload(message)
+	method, target, payload := notifyRequest(message)
 	// 放到 goroutine 里，webhook 慢或挂都不会拖住请求。
 	go func() {
-		response, err := notifyHTTPClient.Post(url, "application/json", bytes.NewReader(payload))
+		var body io.Reader
+		if len(payload) > 0 {
+			body = bytes.NewReader(payload)
+		}
+		request, err := http.NewRequest(method, target, body)
+		if err != nil {
+			log.Printf("[Notify] %s 构造请求失败: %v", event, err)
+			return
+		}
+		if len(payload) > 0 {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		response, err := notifyHTTPClient.Do(request)
 		if err != nil {
 			log.Printf("[Notify] %s 投递失败: %v", event, err)
 			return

@@ -116,7 +116,7 @@ Codex2API 采用三层配置架构：
 | `STREAM_LIMITS_ENABLED` | 否 | `false` | 上游流预算总开关。开启后按规则匹配请求，限制单次上游流的输出内容字符数、墙钟时长与上游原始字节数，超出即中止并向客户端返回固定 payload |
 | `STREAM_LIMITS_RULES` | 否 | 空 | 规则列表（JSON 数组，按顺序匹配，第一条命中即生效）。字段：`name` / `api-keys` / `models` / `base-chars` / `chars-per-input-char` / `min-chars` / `max-chars` / `max-stream-duration` / `max-upstream-bytes`。`api-keys` 与 `models` **留空即匹配任意**，不是必填；`models` 匹配的是客户端请求的模型名（与用量页 `model` 列一致），不是网关模型映射后的名字 |
 | `NOTIFY_WEBHOOK_URL` | 否 | 空 | 事件通知的 webhook 地址。留空则整个通知模块关闭，不发任何请求 |
-| `NOTIFY_WEBHOOK_FORMAT` | 否 | `json` | webhook 载荷格式：`json`（`{"text":"..."}`）/ `text`（纯文本）/ `wecom`（企业微信）/ `feishu`（飞书）/ `dingtalk`（钉钉） |
+| `NOTIFY_WEBHOOK_FORMAT` | 否 | `json` | webhook 载荷格式：`telegram`（GET，把消息拼成 `<url>&text=<urlencoded>`，别名 `tg` / `query`，Telegram Bot API 用这个）/ `json`（`{"text":"..."}`）/ `text`（纯文本）/ `wecom`（企业微信）/ `feishu`（飞书）/ `dingtalk`（钉钉） |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 
