@@ -7623,6 +7623,36 @@ func (s *Store) hasStaticCandidateWithDispatch(apiKeyID int64, exclude map[int64
 	return false
 }
 
+// CountDispatchableAccounts 返回当前可派发的账号数：结构可服务、未冷却、且还有并发额度，
+// filter 为 nil 时统计全部。用于「某类账号整体不可用」这类池级判断（例如 codex 池打空后
+// 通知服务降级），不涉及 API Key 归属，因此与选择路径的 hasDispatchCandidate 分开实现。
+func (s *Store) CountDispatchableAccounts(filter AccountFilter) int {
+	if s == nil {
+		return 0
+	}
+	filter = s.withUsableEgressFilter(filter)
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+	count := 0
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil {
+			continue
+		}
+		if !acc.dispatchableForPolicy(DispatchPolicyStandard) {
+			continue
+		}
+		if s.accountHasBlockingCachedCooldown(acc, DispatchPolicyStandard) {
+			continue
+		}
+		if filter != nil && !filter(acc) {
+			continue
+		}
+		if _, _, _, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, DispatchPolicyStandard); limit > 0 {
+			count++
+		}
+	}
+	return count
+}
+
 func (s *Store) hasDispatchCandidateWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
 	if s == nil {
 		return false

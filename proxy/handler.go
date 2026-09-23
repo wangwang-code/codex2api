@@ -6969,6 +6969,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return
 			}
 			poolMessage := noAvailableAccountMessage(effectiveModel)
+			// 池子打空时重新判定 codex 池状态：无可用账号会触发降级通知，恢复后再发恢复通知。
+			h.refreshCodexPoolState("无可用账号")
 			if isStream && writeCommittedChatRetryError(c, poolMessage) {
 				h.logUnservedRequest(c, "/v1/chat/completions", logModel, effectiveModel, poolMessage, http.StatusServiceUnavailable, isStream, handlerStart)
 				return
@@ -8543,6 +8545,9 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			return codex429Decision{}
 		}
 
+		// 通知运维是哪个号被上游拒了（异步投递，不影响请求链路）。
+		h.notifyAccountUnauthorized(account, upstreamAccountErrorMessage(statusCode, body))
+
 		if h.store.GetAutoCleanUnauthorized() {
 			// 开启自动清理时，401 立即从号池删除
 			log.Printf("账号 %d 收到 401，立即清理", account.ID())
@@ -8556,6 +8561,8 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		} else {
 			h.store.MarkCooldownWithError(account, 5*time.Minute, "unauthorized", upstreamAccountErrorMessage(statusCode, body))
 		}
+		// 这个号退出调度后重新判定 codex 池：最后一个号打空时通知服务降级。
+		h.refreshCodexPoolState("codex 账号 401")
 	case http.StatusPaymentRequired, http.StatusForbidden:
 		if statusCode == http.StatusForbidden && IsAgentRuntimeDeletedError(body) {
 			atomic.StoreInt32(&account.Disabled, 1)
