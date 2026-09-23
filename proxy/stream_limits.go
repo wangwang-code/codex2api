@@ -100,21 +100,35 @@ func streamLimitRulesFromEnv() []streamLimitRule {
 		return nil
 	}
 	for _, rule := range rules {
-		warnIfStreamLimitCeilingBinds(rule)
+		logStreamLimitRuleCurve(rule)
 	}
 	return rules
 }
 
-// warnIfStreamLimitCeilingBinds 在 max-chars 会提前钳制线性项时告警。
-// 一旦钳制生效，预算就不再随输入长度增长，较长的源文本会被无差别中止——CPA 正是在
-// 这里踩坑（256 KiB 的字节上限让超过约 1900 字符的源文本全部被误杀）。
-func warnIfStreamLimitCeilingBinds(rule streamLimitRule) {
+// logStreamLimitRuleCurve 在配置加载时打印规则的预算曲线，便于一眼看出标定是否合理。
+//
+// 预算公式是 clamp(base-chars + 输入字符 × chars-per-input-char, min-chars, max-chars)。
+// 两个钳制都会让比例项失效：下限主导时短输入拿到固定的大预算（例如输入 9 字符却允许
+// 输出 2000 字符），上限主导时长源文本被无差别中止（CPA 踩的就是后者）。把曲线直接
+// 打出来，比事后翻文档更快发现问题——启动日志里看一眼就知道标定对不对。
+func logStreamLimitRuleCurve(rule streamLimitRule) {
+	const (
+		shortInput = 10
+		midInput   = 1000
+		longInput  = 10000
+	)
+	log.Printf("[Config] 流预算规则 %q：预算曲线 clamp(base=%d + 输入×%.2f, min=%d, max=%d) → 输入 %d 字符得 %d；输入 %d 得 %d；输入 %d 得 %d",
+		rule.Name, rule.BaseChars, rule.CharsPerInputChar, rule.MinChars, rule.MaxChars,
+		shortInput, computeStreamContentChars(rule, shortInput),
+		midInput, computeStreamContentChars(rule, midInput),
+		longInput, computeStreamContentChars(rule, longInput))
+
 	if rule.MaxChars <= 0 || rule.CharsPerInputChar <= 0 {
 		return
 	}
 	chars := float64(rule.MaxChars-rule.BaseChars) / rule.CharsPerInputChar
 	if chars <= 0 {
-		log.Printf("[Config] 流预算规则 %q 的 max-chars=%d 低于 base-chars=%d，预算恒为上限，等于固定输出长度上限", rule.Name, rule.MaxChars, rule.BaseChars)
+		log.Printf("[Config] 流预算规则 %q：max-chars=%d 低于 base-chars=%d，预算恒为上限，等于固定输出长度上限", rule.Name, rule.MaxChars, rule.BaseChars)
 		return
 	}
 	log.Printf("[Config] 流预算规则 %q：max-chars=%d 会在输入约 %.0f 字符处开始钳制，超过该长度的请求不再享受随输入增长的预算，可能被误杀；请确认这是预期", rule.Name, rule.MaxChars, chars)

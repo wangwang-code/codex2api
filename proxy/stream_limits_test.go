@@ -203,3 +203,21 @@ func TestUpstreamContentRunesIgnoresReasoningAndTools(t *testing.T) {
 		t.Fatalf("tool call 不应计入预算，got %d", got)
 	}
 }
+
+// TestStreamLimitBudgetCurveForShortInput 固化短输入的预算算术。
+//
+// base-chars / min-chars 共同构成「短输入下限」，输入很小时预算基本就等于它：
+// 设成 2000 会让 9 个字符的输入允许输出 2000+ 字符，比例防御直接失效。
+func TestStreamLimitBudgetCurveForShortInput(t *testing.T) {
+	loose := streamLimitRule{BaseChars: 2000, CharsPerInputChar: 3, MinChars: 2000}
+	if got := computeStreamContentChars(loose, 9); got != 2027 {
+		t.Fatalf("宽松配置：9 字符输入得 %d，公式应为 2000 + 9×3", got)
+	}
+	tight := streamLimitRule{BaseChars: 200, CharsPerInputChar: 4, MinChars: 200}
+	if got := computeStreamContentChars(tight, 9); got != 236 {
+		t.Fatalf("收紧配置：9 字符输入得 %d，公式应为 200 + 9×4", got)
+	}
+	if got := computeStreamContentChars(tight, 1000); got != 4200 {
+		t.Fatalf("收紧配置：1000 字符输入得 %d，公式应为 200 + 1000×4", got)
+	}
+}

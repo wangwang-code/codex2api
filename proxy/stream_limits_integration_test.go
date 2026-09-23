@@ -171,3 +171,48 @@ func TestChatCompletionsStreamLimitDisabledPassesThrough(t *testing.T) {
 		t.Fatalf("关闭时应当放行全部 %d 个内容帧，实际 %d", 200, got)
 	}
 }
+
+// TestStreamLimitAbortBypassesUpstreamErrorRewrite 验证预算中止不会被上游错误消息
+// 改写覆盖。它是本地请求级失败，改写会把用量页里的真实原因（输出失控）盖成
+// 「上游服务暂时不可用」，让运维无从判断这次中止到底发生了什么。
+func TestStreamLimitAbortBypassesUpstreamErrorRewrite(t *testing.T) {
+	withStreamLimitRule(t, streamLimitRule{Name: "translation", BaseChars: 20, CharsPerInputChar: 1, MinChars: 20})
+	withUpstreamErrorRewrite(t, true, "", map[int]string{502: "[云翻译]上游服务暂时不可用，请稍后重试"})
+
+	var calls atomic.Int32
+	upstream := streamLimitUpstream(t, &calls, 200)
+	h, router := newStreamLimitTestHandler(t, upstream.URL, 0)
+
+	response := performModelQuotaRequest(router, "/v1/chat/completions",
+		`{"model":"gpt-6-astra","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	body := response.Body.String()
+
+	if !strings.Contains(body, "upstream_response_too_large") {
+		t.Fatalf("客户端应收到预算中止 payload: %q", body)
+	}
+	if strings.Contains(body, "[云翻译]上游服务暂时不可用") {
+		t.Fatalf("客户端不应看到被改写后的上游文案: %q", body)
+	}
+
+	h.db.FlushUsageLogs()
+	logs, err := h.db.ListUsageLogsByFilter(context.Background(), database.UsageLogFilter{
+		Start: time.Now().Add(-time.Minute), End: time.Now().Add(time.Minute), IncludeCanceled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("usage log rows = %d, want 1", len(logs))
+	}
+	entry := logs[0]
+	t.Logf("logged: kind=%q message=%q", entry.UpstreamErrorKind, entry.ErrorMessage)
+	if entry.UpstreamErrorKind != "stream_budget" {
+		t.Fatalf("logged kind = %q, want stream_budget", entry.UpstreamErrorKind)
+	}
+	if strings.Contains(entry.ErrorMessage, "[云翻译]上游服务暂时不可用") {
+		t.Fatalf("用量记录被上游错误改写覆盖，真实原因丢失: %q", entry.ErrorMessage)
+	}
+	if !strings.Contains(entry.ErrorMessage, "流预算") {
+		t.Fatalf("用量记录应保留真实中止原因: %q", entry.ErrorMessage)
+	}
+}

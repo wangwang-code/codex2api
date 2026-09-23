@@ -7769,7 +7769,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
-		outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
+		// 流预算中止是本地请求级失败、不是上游错误，按 CPA 的语义跳过改写——否则
+		// 用量页会显示成「上游服务不可用」，把真实中止原因（输出失控）盖掉。
+		if !streamLimitBreached {
+			outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
+		}
 		if streamLimitBreached {
 			// 流预算中止：固定 payload（已提交流走 SSE 错误帧），不换号重试。
 			writeStreamLimitAbort(c)
