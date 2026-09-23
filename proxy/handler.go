@@ -6832,6 +6832,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	// 上游流预算：命中规则时按输入长度推导输出上限，模型输出失控即中止。
+	// streamLimitBreached 跨 attempt 保持，一旦触发就不再换号重试（见 stream_limits.go）。
+	streamLimit := newStreamLimitStateForRequest(c, model, rawBody)
+	streamLimitBreached := false
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -7409,6 +7413,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+				if streamLimit != nil && streamLimit.observe(len(data), upstreamContentRunes(eventType, parsed)) {
+					streamLimitBreached = true
+					return false
+				}
 				if eventType == "response.failed" {
 					statusCode := classifyResponseFailedOutcome(data).logStatusCode
 					var incidentID string
@@ -7579,6 +7587,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				outputCollector.Add(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+				if streamLimit != nil && streamLimit.observe(len(data), upstreamContentRunes(eventType, parsed)) {
+					streamLimitBreached = true
+					return false
+				}
 				ttftGuard.MarkProgress(eventType)
 				if !ttftRecorded && isLooseFirstTokenResult(parsed) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
@@ -7634,6 +7646,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
+		// 上游流预算中止：本地终态（502 + terminalLocal），不换号重试。
+		if streamLimitBreached {
+			outcome = streamLimitOutcome(streamLimit)
+		}
 		var candidatePromoted bool
 		terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
 		if candidatePromoted && isStream {
@@ -7752,7 +7768,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
 		outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
-		if isStream && outcome.terminalLocal {
+		if streamLimitBreached {
+			// 流预算中止：固定 payload（已提交流走 SSE 错误帧），不换号重试。
+			writeStreamLimitAbort(c)
+		} else if isStream && outcome.terminalLocal {
 			writeContinuousRetryLocalChatError(c)
 		} else if isStream && abortedForHTTPError && !downstreamWrote {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,

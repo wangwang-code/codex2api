@@ -113,6 +113,8 @@ Codex2API 采用三层配置架构：
 | `UPSTREAM_ERROR_REWRITE_ENABLED` | 否 | `false` | 上游错误消息改写总开关。打开后按客户端实际收到的 HTTP 状态码替换错误 `message`，并停止透传上游原始 error body 与上游身份 |
 | `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` | 否 | 空 | 未在下面列出的状态码使用的默认文案；留空表示这些状态码原样透出 |
 | `UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` | 否 | 空 | 状态码到文案的映射。`\|` 分隔的 `状态码=文案`，或 JSON 对象；`\|` 写法逐项还原转义 |
+| `STREAM_LIMITS_ENABLED` | 否 | `false` | 上游流预算总开关。开启后按规则匹配请求，限制单次上游流的输出内容字符数、墙钟时长与上游原始字节数，超出即中止并向客户端返回固定 payload |
+| `STREAM_LIMITS_RULES` | 否 | 空 | 规则列表（JSON 数组，按顺序匹配，第一条命中即生效）。字段：`name` / `api-keys` / `models` / `base-chars` / `chars-per-input-char` / `min-chars` / `max-chars` / `max-stream-duration` / `max-upstream-bytes` |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 
@@ -343,6 +345,10 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 文案的转义语义与 CPA 的 YAML 双引号对齐：`.env` 本身不做转义，因此 `STREAM_FAKE_THINKING_TEXT` 与 `STREAM_FAKE_THINKING_TEXTS` 的 `|` 写法都会由网关还原 `\n` `\r` `\t` `\\` `\"`，让线上 YAML 配置可以逐字平移；`STREAM_FAKE_THINKING_TEXTS` 的 JSON 数组写法则交给 JSON 解码器。文案开头的换行符会原样写入 `reasoning_content`（不会被裁剪），只做「纯空白即视为空项」的判断。首帧文案留空时回落到内置英文文案，与 CPA `buildEarlyThinkingChunk` 的兜底一致，中文业务应显式设置 `STREAM_FAKE_THINKING_TEXT`。
 
 上游错误消息改写（`UPSTREAM_ERROR_REWRITE_*`，迁移自 CPA 的 `error-rewrite` 补丁）按**客户端实际收到的 HTTP 状态码**生效：命中配置时只替换错误体的 `message`，并停止把上游原始 error body（含上游身份、请求 id）透给客户端。改写点覆盖非流式 JSON 出口（`sendUpstreamError`、`sendFinalUpstreamError` 的池级 503 分支、`ErrorToGinResponse`）、已提交流的 SSE 错误帧（Responses / Chat Completions / Messages / Images 的上游错误出口）、连续重试到期时的「最后一次上游失败回放」（该路径原本会原样回放上游 JSON body），以及 Grok 原生透传出口。网关自有的 `type` / `code` 会被保留，下游依赖 `code` 做重试判定时不受影响；用量日志仍记录真实上游原因，运维排查不被改写影响。`UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` 用 `|` 分隔的 `状态码=文案` 或 JSON 对象书写，`|` 写法逐项还原 `\n` 等转义；未配置的状态码在 `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` 非空时使用默认文案，否则原样透出。响应式 WebSocket 路径继续由运行时开关 `CodexWSHideErrors`（默认开启、固定文案）负责，本改写不与之叠加。
+
+上游流预算（`STREAM_LIMITS_*`，迁移自 CPA 的 `stream-limits` 补丁）防止上游模型「输出失控」——不按预期翻译、无限输出、长时间挂着不下线。命中规则时按输入字符数线性推导**输出内容字符**预算，并可选限制墙钟时长与上游原始读取字节；超出即中止上游流，按已提交/未提交流分别以 SSE 错误帧或 502 JSON 返回固定 payload `{"error":{"message":"模型输出失控，已中止","type":"server_error","param":null,"code":"upstream_response_too_large"}}`，并按请求级终态处理（不换号重试——输出失控与账号无关，换号只会再跑一遍同样失控的输出）。用量日志会以 `upstream_error_kind=stream_budget` 记录。
+
+**标定口径是本功能的关键，CPA 正是在这里踩过坑**：CPA 的字节预算数的是「下游已翻译的 SSE 帧字节」，而每个 `chat.completion.chunk` 帧的 JSON 信封本身就有约 281 字节、只装 1-3 个答案字符，导致实测消耗是 80-137 字节/输入字符——按「输入字符 × 32 字节」配的预算提前 3~4 倍耗尽；再叠上 `max-bytes` 钳制（256 KiB），任何超过约 1900 字符的源文本都会被误杀。也就是说字节预算实际上退化成了「帧数预算」，与输出长度严重非线性。因此本实现的预算以**输出内容字符**为准（只数答案文本，不数 reasoning 与 tool call），单位与协议、分帧方式无关；输入字符数也按 rune 计（中文算 1 个字符，不按 3 字节放大）。字节兜底只数**读到的上游原始字节**，不数下游帧。另外 `max-chars` 一旦钳制生效，预算就不再随输入增长，长源文本会被无差别中止——配置加载时若检测到钳制会在较早的输入长度上生效，会打印告警提醒确认。
 
 单次流式尝试的暂存上限为 64 MiB，前 8 MiB 使用内存，之后写入立即 unlink 的 mode-0600 临时文件；暂存超限或存储失败会作为本地错误立即停止。当前没有跨请求的进程级暂存总预算，高并发环境需要另行限制并发并监控内存与临时磁盘。Responses HTTP 等待期间若 SSE 心跳已提交响应头，最终成功账号的 `X-Codex-Turn-State` 无法再补发，因此实现会省略该头而不会转发失败账号的状态；无法安全展开为自包含请求的账号绑定 continuation 也不会强行换号。
 
