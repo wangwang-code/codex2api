@@ -6769,6 +6769,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 请求起始时间：账号选择阶段就可能失败（无可用账号 / 并发窗口已满），
 	// 那些分支也要把真实耗时记进用量日志。
 	handlerStart := time.Now()
+	// 请求阶段跟踪：保活生效前下游不会有任何字节，卡在这一段时靠看门狗把阶段打进日志
+	// （否则只能看到「连接活着但零 SSE」，无从判断卡在读体/校验/翻译/准入/过滤链哪一步）。
+	phase := newRequestPhaseTracker()
+	watchRequestStallFor(c, "/v1/chat/completions", phase)
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -6776,6 +6780,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	phase.set(phaseValidate)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -6815,6 +6820,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		logModel = model
 		responseModel = model
 	}
+	phase.setModel(logModel)
 	if isMediaOnlyModel(model) {
 		sendImageOnlyModelError(c, model)
 		return
@@ -6848,6 +6854,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
+	phase.set(phaseTranslate)
 	codexBody, err := TranslateRequest(rawBody)
 	if err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
@@ -6857,6 +6864,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	toolNameRestore := ChatToolNameRestoreMap(rawBody)
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
+	phase.set(phaseQuota)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
@@ -6869,6 +6877,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
+	phase.set(phaseAccountFilter)
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
@@ -6878,6 +6887,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolChat)
 	defer stopRetryDeadline()
+	// 从这里开始保活生效：下游至少会收到抢先假思考首帧或心跳，不再是「完全没有字节」
+	// 的场景，卡顿看门狗收工。
+	phase.set(phaseWaitingUpstream)
 	// 伪装思考（CPA 抢先思考 + 按序 Keepalive 假思考的迁移）：总开关打开且为
 	// 流式时，把保活载荷换成可配置的假思考帧——首帧在开流时立即发出，之后每次
 	// 心跳按序附加一条文案；首个上游真实内容到达后自动退回纯注释心跳。
