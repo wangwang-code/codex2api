@@ -61,25 +61,90 @@ func streamFakeThinkingImmediateFromEnv() bool {
 
 // streamFakeThinkingTextFromEnv 读取开流首帧的假思考文案；留空用内置默认文案。
 func streamFakeThinkingTextFromEnv() string {
-	return strings.TrimSpace(os.Getenv("STREAM_FAKE_THINKING_TEXT"))
+	return parseStreamFakeThinkingText(os.Getenv("STREAM_FAKE_THINKING_TEXT"))
+}
+
+// parseStreamFakeThinkingText 解析首帧文案原始值。
+// 值与 CPA 的 YAML 双引号语义对齐：`\n` 等转义会还原成真实字符，首尾空白原样保留
+// （线上文案靠开头的 `\n` 换行，不能被裁掉）；纯空白视为未配置。
+func parseStreamFakeThinkingText(raw string) string {
+	value := decodeStreamEscapes(raw)
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return value
 }
 
 // streamFakeThinkingTextsFromEnv 读取按序 Keepalive 文案列表。
-// 支持两种写法：JSON 数组，或 `|` 分隔的字符串（保留空项，空项=该次只发心跳）。
 func streamFakeThinkingTextsFromEnv() []string {
-	raw := strings.TrimSpace(os.Getenv("STREAM_FAKE_THINKING_TEXTS"))
-	if raw == "" {
+	return parseStreamFakeThinkingTexts(os.Getenv("STREAM_FAKE_THINKING_TEXTS"))
+}
+
+// parseStreamFakeThinkingTexts 解析按序文案原始值，支持两种写法：
+//   - JSON 数组（转义由 JSON 解码器负责）
+//   - `|` 分隔的字符串（逐项做转义还原，保留空项：空项=该次只发心跳，下标继续推进）
+//
+// 分隔符先切再解码，所以文案本身可以含有解码后才出现的换行。
+// 注意 .env 两种写法的差异：不加引号时值里是字面 `\n`（由本函数还原）；加了双引号时
+// godotenv 已经还原过换行，本函数看不到反斜杠，因此不会重复解码。
+func parseStreamFakeThinkingTexts(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	if strings.HasPrefix(raw, "[") {
+	// 只对「是否为空」和「是不是 JSON」做去空白判断，真正切分用原值：
+	// 双引号写法下 godotenv 不做裁剪，首项开头的换行必须保留；不加引号时
+	// godotenv 已裁掉首尾空格，这里无需再裁。
+	if trimmed := strings.TrimSpace(raw); strings.HasPrefix(trimmed, "[") {
 		var list []string
-		if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
 			log.Printf("[Config] STREAM_FAKE_THINKING_TEXTS 不是合法 JSON 数组，已忽略: %v", err)
 			return nil
 		}
 		return list
 	}
-	return strings.Split(raw, "|")
+	parts := strings.Split(raw, "|")
+	for i := range parts {
+		parts[i] = decodeStreamEscapes(parts[i])
+	}
+	return parts
+}
+
+// decodeStreamEscapes 把 `\n` / `\r` / `\t` / `\\` / `\"` 等转义还原成真实字符，
+// 让 CPA 的 YAML 文案可以直接平移到 .env（.env 不做转义，必须由这里补齐）。
+// 无法识别的转义原样保留，避免误伤文案里正常的反斜杠。
+func decodeStreamEscapes(value string) string {
+	if !strings.Contains(value, `\`) {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\\' || i+1 >= len(value) {
+			out.WriteByte(value[i])
+			continue
+		}
+		i++
+		switch value[i] {
+		case 'n':
+			out.WriteByte('\n')
+		case 'r':
+			out.WriteByte('\r')
+		case 't':
+			out.WriteByte('\t')
+		case '\\':
+			out.WriteByte('\\')
+		case '"':
+			out.WriteByte('"')
+		case '\'':
+			out.WriteByte('\'')
+		case '0':
+			out.WriteByte(0)
+		default:
+			out.WriteByte('\\')
+			out.WriteByte(value[i])
+		}
+	}
+	return out.String()
 }
 
 // ConfigureStreamFakeThinkingFromEnv 在 config.Load 读取 .env 后刷新伪装思考配置。
@@ -123,14 +188,20 @@ type fakeThinkingState struct {
 }
 
 // newFakeThinkingStateForChat 在总开关打开时为 chat 协议构造共享状态，否则返回 nil。
+// 首帧文案留空时回落到内置默认文案，与 CPA buildEarlyThinkingChunk 的兜底一致，
+// 保证「抢先开流」永远能发出一帧假思考。
 func newFakeThinkingStateForChat(responseModel string) *fakeThinkingState {
 	if !streamFakeThinkingEnabled {
 		return nil
 	}
+	firstText := streamFakeThinkingText
+	if strings.TrimSpace(firstText) == "" {
+		firstText = defaultFakeThinkingText
+	}
 	return &fakeThinkingState{
 		protocol:         fakeThinkingProtocolChat,
 		model:            strings.TrimSpace(responseModel),
-		firstText:        streamFakeThinkingText,
+		firstText:        firstText,
 		texts:            streamFakeThinkingTexts,
 		primeImmediately: streamFakeThinkingImmediate,
 	}
@@ -205,10 +276,10 @@ type fakeThinkingDelta struct {
 }
 
 // buildFakeThinkingFrame 构造一个只有 reasoning_content、没有 content 的
-// chat.completion.chunk 数据帧（含 `data: ` 前缀与空行结尾），文案为空时返回空串。
+// chat.completion.chunk 数据帧（含 `data: ` 前缀与空行结尾）。
+// 文案按原样写入，不做裁剪——线上文案开头的 `\n` 必须保留；纯空白视为空文案。
 func buildFakeThinkingFrame(model, text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
+	if strings.TrimSpace(text) == "" {
 		return ""
 	}
 	chunk := fakeThinkingChunk{

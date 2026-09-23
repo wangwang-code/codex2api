@@ -107,8 +107,8 @@ Codex2API 采用三层配置架构：
 | `DOWNSTREAM_WS_KEEPALIVE_INTERVAL` | 否 | `45s` | 下游 WebSocket Ping 周期，使用 Go duration；`0` 关闭。覆盖 Responses、Realtime 与 Live Sideband |
 | `STREAM_FAKE_THINKING_ENABLED` | 否 | `false` | 伪装思考总开关。打开后仅对 `/v1/chat/completions` 流式响应生效，在等待上游首个内容 token 期间把保活载荷换成只带 `delta.reasoning_content` 的 `chat.completion.chunk` 假帧 |
 | `STREAM_FAKE_THINKING_IMMEDIATE` | 否 | `true` | 首个心跳是否立即落地（抢先开流）。开启时请求一进入等待上游阶段就提交 SSE 200 并发出开流首帧；关闭时等满一个保活周期 |
-| `STREAM_FAKE_THINKING_TEXT` | 否 | 内置英文文案 | 开流首帧的假思考文案 |
-| `STREAM_FAKE_THINKING_TEXTS` | 否 | 空 | 每次 Keepalive 按序附加的假思考文案，`\|` 分隔或 JSON 数组。空项=该次只发心跳但下标继续推进，列表耗尽后恢复纯心跳 |
+| `STREAM_FAKE_THINKING_TEXT` | 否 | 内置英文文案 | 开流首帧的假思考文案。留空回落到内置英文文案，中文业务应显式设置。支持 `\n` `\r` `\t` `\\` `\"` 转义 |
+| `STREAM_FAKE_THINKING_TEXTS` | 否 | 空 | 每次 Keepalive 按序附加的假思考文案，`\|` 分隔或 JSON 数组。空项=该次只发心跳但下标继续推进，列表耗尽后恢复纯心跳。`\|` 写法逐项还原转义，文案开头的 `\n` 会保留 |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 
@@ -331,6 +331,8 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 配置 API Key 模型请求次数预算时，额度准入完成前不会因保活提交 SSE 200；准入或重试也不会重新开启已关闭的 Claude 保活。普通 Responses、Chat Completions 和 Messages 请求在下游取消后停止发送心跳，并沿用最多 5 秒的上游 usage 补读窗口；持续重试的响应读取仍随下游取消立即结束。
 
 伪装思考（`STREAM_FAKE_THINKING_*`，迁移自 CPA 抢先思考补丁）在总开关打开后只改 `/v1/chat/completions` 的保活载荷：`STREAM_FAKE_THINKING_IMMEDIATE` 为真时，请求一进入等待上游的阶段就提交 SSE 200 并发出开流首帧（只带 `delta.reasoning_content`、不带 `delta.content` 的 `chat.completion.chunk`），随后每次心跳在标准 `: keepalive` 注释后按 `STREAM_FAKE_THINKING_TEXTS` 的顺序附加一条假思考帧，空项只发心跳但下标继续推进，列表耗尽后恢复纯心跳。上游首个真实内容 token 一到即停止注入。Responses、Messages、Gemini 等其它协议不下发本协议的帧，仍使用原有注释/ping 心跳。与 CPA 抢先模式同样的取舍：开启抢先开流后上游在首字节前的报错会以 SSE 错误帧呈现，而不再返回 HTTP 4xx JSON；需要保留真实错误状态码时请把 `STREAM_FAKE_THINKING_IMMEDIATE` 设为 `false`，只保留按序假思考心跳。
+
+文案的转义语义与 CPA 的 YAML 双引号对齐：`.env` 本身不做转义，因此 `STREAM_FAKE_THINKING_TEXT` 与 `STREAM_FAKE_THINKING_TEXTS` 的 `|` 写法都会由网关还原 `\n` `\r` `\t` `\\` `\"`，让线上 YAML 配置可以逐字平移；`STREAM_FAKE_THINKING_TEXTS` 的 JSON 数组写法则交给 JSON 解码器。文案开头的换行符会原样写入 `reasoning_content`（不会被裁剪），只做「纯空白即视为空项」的判断。首帧文案留空时回落到内置英文文案，与 CPA `buildEarlyThinkingChunk` 的兜底一致，中文业务应显式设置 `STREAM_FAKE_THINKING_TEXT`。
 
 单次流式尝试的暂存上限为 64 MiB，前 8 MiB 使用内存，之后写入立即 unlink 的 mode-0600 临时文件；暂存超限或存储失败会作为本地错误立即停止。当前没有跨请求的进程级暂存总预算，高并发环境需要另行限制并发并监控内存与临时磁盘。Responses HTTP 等待期间若 SSE 心跳已提交响应头，最终成功账号的 `X-Codex-Turn-State` 无法再补发，因此实现会省略该头而不会转发失败账号的状态；无法安全展开为自包含请求的账号绑定 continuation 也不会强行换号。
 

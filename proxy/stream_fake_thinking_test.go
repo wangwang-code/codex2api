@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // TestStreamFakeThinkingEnabledFromEnv 验证总开关的默认值与识别规则。
@@ -227,5 +229,174 @@ func TestFakeThinkingPayloadFuncOverridesStaticPayload(t *testing.T) {
 	}
 	if got := options.payloadFunc(); !strings.Contains(got, "开流首帧") {
 		t.Fatalf("dynamic payload = %q", got)
+	}
+}
+
+// productionFakeThinkingTexts 是 CPA 侧线上真实使用的按序文案。YAML 双引号里的
+// `\n` 会被解析成真实换行符，所以这里直接用带真实换行的字符串复现线上取值。
+var productionFakeThinkingTexts = []string{
+	"\n云翻译处于灰测中",
+	"",
+	"\n再耐心等等...",
+	"\n这有点超出预计耗时了",
+}
+
+// reasoningOf 从假思考帧里取出 reasoning_content，便于断言换行等不可见字符。
+func reasoningOf(t *testing.T, payload string) string {
+	t.Helper()
+	idx := strings.Index(payload, "data: ")
+	if idx < 0 {
+		t.Fatalf("payload carries no data frame: %q", payload)
+	}
+	raw := payload[idx+len("data: "):]
+	if end := strings.Index(raw, "\n\n"); end >= 0 {
+		raw = raw[:end]
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		t.Fatalf("frame is not valid JSON: %v (%q)", err, raw)
+	}
+	if len(chunk.Choices) != 1 {
+		t.Fatalf("choices = %d, want 1", len(chunk.Choices))
+	}
+	return chunk.Choices[0].Delta.ReasoningContent
+}
+
+// TestFakeThinkingPreservesProductionLineBreaks 用线上真实文案核对按序取用与换行保留。
+// 重点：文案开头的 `\n` 必须原样进入 reasoning_content，空项只发心跳且下标继续推进。
+func TestFakeThinkingPreservesProductionLineBreaks(t *testing.T) {
+	state := &fakeThinkingState{
+		protocol:  fakeThinkingProtocolChat,
+		model:     "gpt-5.6-codex",
+		firstText: "开流首帧",
+		texts:     productionFakeThinkingTexts,
+	}
+
+	if got := reasoningOf(t, state.payload()); got != "开流首帧" {
+		t.Fatalf("preemptive frame reasoning = %q, want %q", got, "开流首帧")
+	}
+
+	beat := func(index int, want string) {
+		t.Helper()
+		payload := state.payload()
+		if !strings.HasPrefix(payload, continuousRetryKeepaliveComment) {
+			t.Fatalf("beat %d must start with the SSE comment, got %q", index, payload)
+		}
+		if got := reasoningOf(t, payload); got != want {
+			t.Fatalf("beat %d reasoning = %q, want %q", index, got, want)
+		}
+	}
+	beat(1, "\n云翻译处于灰测中")
+
+	skipped := state.payload()
+	if skipped != continuousRetryKeepaliveComment {
+		t.Fatalf("empty entry must emit the comment only, got %q", skipped)
+	}
+
+	beat(3, "\n再耐心等等...")
+	beat(4, "\n这有点超出预计耗时了")
+
+	if got := state.payload(); got != continuousRetryKeepaliveComment {
+		t.Fatalf("exhausted list must fall back to the comment only, got %q", got)
+	}
+}
+
+// TestNewFakeThinkingStateFallsBackToDefaultFirstText 验证首帧文案留空时回落到内置
+// 默认文案（与 CPA buildEarlyThinkingChunk 的兜底一致），保证抢先开流一定发出假帧。
+func TestNewFakeThinkingStateFallsBackToDefaultFirstText(t *testing.T) {
+	restoreEnabled, restoreText := streamFakeThinkingEnabled, streamFakeThinkingText
+	defer func() {
+		streamFakeThinkingEnabled = restoreEnabled
+		streamFakeThinkingText = restoreText
+	}()
+
+	streamFakeThinkingEnabled = true
+	streamFakeThinkingText = ""
+	state := newFakeThinkingStateForChat("gpt-5.6-codex")
+	if state == nil {
+		t.Fatal("state must be built when the master switch is on")
+	}
+	if state.firstText != defaultFakeThinkingText {
+		t.Fatalf("first text = %q, want the built-in default", state.firstText)
+	}
+	if got := reasoningOf(t, state.payload()); got != defaultFakeThinkingText {
+		t.Fatalf("preemptive reasoning = %q", got)
+	}
+
+	streamFakeThinkingText = "\n自定义首帧"
+	state = newFakeThinkingStateForChat("gpt-5.6-codex")
+	if got := reasoningOf(t, state.payload()); got != "\n自定义首帧" {
+		t.Fatalf("preemptive reasoning = %q, want the configured text", got)
+	}
+}
+
+// TestStreamFakeThinkingTextsDecodeEscapes 验证 `|` 分隔写法支持转义，让线上配置可以
+// 直接从 YAML 平移过来（.env 里写 \n 必须还原成真实换行，而不是字面反斜杠 n）。
+func TestStreamFakeThinkingTextsDecodeEscapes(t *testing.T) {
+	t.Setenv("STREAM_FAKE_THINKING_TEXTS", `\n云翻译处于灰测中||\n再耐心等等...|\n这有点超出预计耗时了`)
+	got := streamFakeThinkingTextsFromEnv()
+	if len(got) != len(productionFakeThinkingTexts) {
+		t.Fatalf("texts = %#v, want %d entries", got, len(productionFakeThinkingTexts))
+	}
+	for i, want := range productionFakeThinkingTexts {
+		if got[i] != want {
+			t.Fatalf("texts[%d] = %q, want %q", i, got[i], want)
+		}
+	}
+}
+
+// TestStreamFakeThinkingTextDecodesEscapes 验证首帧文案同样支持转义。
+func TestStreamFakeThinkingTextDecodesEscapes(t *testing.T) {
+	t.Setenv("STREAM_FAKE_THINKING_TEXT", `\n云翻译处于灰测中`)
+	if got := streamFakeThinkingTextFromEnv(); got != "\n云翻译处于灰测中" {
+		t.Fatalf("first text = %q, want a real newline prefix", got)
+	}
+	t.Setenv("STREAM_FAKE_THINKING_TEXT", `   `)
+	if got := streamFakeThinkingTextFromEnv(); got != "" {
+		t.Fatalf("blank first text must be treated as unset, got %q", got)
+	}
+}
+
+// TestStreamFakeThinkingTextsSurviveDotenvParsing 用真实 .env 解析器（godotenv v1.5.1）
+// 核对两种写法，保证线上 YAML 配置平移过来后拿到的是真实换行、不是字面反斜杠 n，
+// 也不会被重复解码。不加引号时 godotenv 不解码转义（交给本包还原）；加双引号时
+// godotenv 已经还原过换行（本包不再重复处理）。
+func TestStreamFakeThinkingTextsSurviveDotenvParsing(t *testing.T) {
+	for _, tc := range []struct{ name, snippet string }{
+		{
+			name: "unquoted",
+			snippet: `STREAM_FAKE_THINKING_TEXTS=\n云翻译处于灰测中||\n再耐心等等...|\n这有点超出预计耗时了` + "\n" +
+				`STREAM_FAKE_THINKING_TEXT=\n云翻译处于灰测中` + "\n",
+		},
+		{
+			name: "double-quoted",
+			snippet: `STREAM_FAKE_THINKING_TEXTS="\n云翻译处于灰测中||\n再耐心等等...|\n这有点超出预计耗时了"` + "\n" +
+				`STREAM_FAKE_THINKING_TEXT="\n云翻译处于灰测中"` + "\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values, err := godotenv.Parse(strings.NewReader(tc.snippet))
+			if err != nil {
+				t.Fatalf("parse .env snippet: %v", err)
+			}
+			if got := parseStreamFakeThinkingText(values["STREAM_FAKE_THINKING_TEXT"]); got != "\n云翻译处于灰测中" {
+				t.Fatalf("first text = %q, want a real newline prefix", got)
+			}
+			got := parseStreamFakeThinkingTexts(values["STREAM_FAKE_THINKING_TEXTS"])
+			if len(got) != len(productionFakeThinkingTexts) {
+				t.Fatalf("texts = %#v, want %d entries", got, len(productionFakeThinkingTexts))
+			}
+			for i, want := range productionFakeThinkingTexts {
+				if got[i] != want {
+					t.Fatalf("texts[%d] = %q, want %q", i, got[i], want)
+				}
+			}
+		})
 	}
 }
