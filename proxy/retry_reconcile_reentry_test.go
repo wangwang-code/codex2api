@@ -34,6 +34,10 @@ func newReconcileReentryStore(t *testing.T, dbName string) (*auth.Store, *databa
 func TestNextRetryAccountReentersLoopAfterReconcile(t *testing.T) {
 	ctx := context.Background()
 	store, db := newReconcileReentryStore(t, "retry-reconcile-reentry.db")
+	// 契约变更：池里连一个结构性候选都没有时，调度等待会立即失败（不再空等），
+	// 那样这个用例还没来得及等到 reconcile 就返回了。放一个冷却中的账号让等待者
+	// 停在队列里，本用例真正要守的「reconcile 重新入队后能捞到 DB 里的账号」不变。
+	parkSchedulerWaiterAccount(t, store)
 
 	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "reentry-endpoint", map[string]interface{}{
 		"upstream_type": auth.UpstreamOpenAIResponses,

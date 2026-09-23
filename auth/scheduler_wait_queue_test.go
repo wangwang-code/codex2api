@@ -266,7 +266,11 @@ func TestSchedulerWaitCancellationAfterAdmissionReleasesSlot(t *testing.T) {
 func TestSchedulerWaitStopAndTimeoutDrainQueue(t *testing.T) {
 	for _, stop := range []bool{false, true} {
 		t.Run(map[bool]string{false: "timeout", true: "stop"}[stop], func(t *testing.T) {
-			s := newSchedulerWaitTestStore(t, 0)
+			// 契约变更：池里连一个结构性候选都没有时不再排队空等（会立即失败），
+			// 因此放一个「结构上可服务、但正在冷却」的账号让等待者真正停在队列里，
+			// 才能继续验证超时/停止时的排空与指标。
+			s := newSchedulerWaitTestStore(t, 1)
+			s.MarkCooldown(s.accounts[0], time.Minute, "drain-queue-test")
 			done := make(chan error, 1)
 			go func() {
 				_, _, _, err := s.WaitForDispatchAvailable(context.Background(), "", 30*time.Millisecond, 1, nil, nil, false, DispatchPolicyStandard)

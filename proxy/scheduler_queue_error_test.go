@@ -17,10 +17,26 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// parkSchedulerWaiterAccount 给「空池」场景放一个停放账号：结构上可服务（凭据齐全、
+// 未被停用），但处于冷却中，所以等待者会正常停在调度队列里。
+//
+// 契约变更说明：池里连一个结构性候选都没有时，调度等待不再空等（会立即失败，避免把
+// 客户端挂满超时）。下面这些用例真正要验证的是队列行为——满队拒绝、超时/停止排空、
+// 心跳不扰动队列、reconcile 重新入队——因此用一个冷却账号把等待者停在队列里，
+// 而不是依赖「空池也排队」。
+func parkSchedulerWaiterAccount(t *testing.T, store *auth.Store) *auth.Account {
+	t.Helper()
+	account := &auth.Account{DBID: 9001, AccessToken: "parking-token", PlanType: "plus"}
+	store.AddAccount(account)
+	store.MarkCooldown(account, time.Minute, "scheduler-queue-test")
+	return account
+}
+
 func saturatedSchedulerQueue(t *testing.T) *auth.Store {
 	t.Helper()
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
 	t.Cleanup(store.Stop)
+	parkSchedulerWaiterAccount(t, store)
 	store.SetSchedulerWaitLimits(1, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -187,6 +203,7 @@ func TestSchedulerWaitHeartbeatPreservesOneAdmission(t *testing.T) {
 	t.Cleanup(func() { continuousRetryKeepaliveInterval = previous })
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
 	defer store.Stop()
+	parkSchedulerWaiterAccount(t, store)
 	h := &Handler{store: store}
 	keepalive := &recordingContinuousRetryKeepalive{active: true}
 	ctx, cancel := context.WithTimeout(contextWithContinuousRetryKeepalive(keepalive), 35*time.Millisecond)

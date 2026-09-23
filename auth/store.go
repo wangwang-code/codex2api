@@ -7558,6 +7558,71 @@ func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64
 	return s.hasDispatchCandidateWithDispatch(apiKeyID, exclude, filter, DispatchPolicyStandard)
 }
 
+// structurallyDispatchable 报告账号在「结构上」可服务：未被停用、未被封禁、持有可用
+// 凭据。与 IsAvailable 的区别是**不看**冷却、限流窗口、用量窗口、并发槽位、懒加载
+// 待探测这些暂态阻塞。
+//
+// 调度等待队列用 IsAvailable 决定「现在能不能立刻派发」，用本方法决定「这个请求在池里
+// 到底有没有归属」：连结构上的候选都没有时，等满超时也不会冒出账号来。
+func (a *Account) structurallyDispatchable() bool {
+	if a == nil {
+		return false
+	}
+	if atomic.LoadInt32(&a.Disabled) != 0 {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.Status == StatusError {
+		return false
+	}
+	// Antigravity 的 unauthorized 冷却会走专用恢复路径（见 isAvailableLocked），
+	// 因此 banned 也不能一概排除，否则有凭据的账号会被误判成「池里没有归属」。
+	if a.isAntigravityAPILocked() {
+		if a.healthTierLocked() == HealthTierBanned && !a.antigravityUnauthorizedRecoveryLocked(time.Now()) {
+			return false
+		}
+		return a.hasDispatchCredentialLocked()
+	}
+	if a.healthTierLocked() == HealthTierBanned {
+		return false
+	}
+	return a.hasDispatchCredentialLocked()
+}
+
+// hasStaticCandidateWithDispatch 报告池内是否存在「结构性可服务」的账号：账号未被
+// 停用/封禁、持有凭据、满足 API Key 与模型/渠道/分组等结构约束，但**不考虑**冷却、
+// 并发槽位、懒加载待探测这些暂态阻塞。
+//
+// 与 hasDispatchCandidateWithDispatch 的分工：后者回答「现在能不能立刻派发」（含槽位
+// 与冷却），本函数回答「这个请求在池里到底有没有归属」。调度等待队列用前者决定唤醒，
+// 用本函数决定是否值得等待——一个结构性候选都没有时，等满超时也不会冒出账号来，
+// 应当立即失败而不是把客户端挂住。
+func (s *Store) hasStaticCandidateWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
+	if s == nil {
+		return false
+	}
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil {
+			continue
+		}
+		if exclude != nil && exclude[acc.DBID] {
+			continue
+		}
+		if !acc.structurallyDispatchable() {
+			continue
+		}
+		if !s.accountAllowedForAPIKey(acc, apiKeyID) {
+			continue
+		}
+		if filter != nil && !filter(acc) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s *Store) hasDispatchCandidateWithDispatch(apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) bool {
 	if s == nil {
 		return false
@@ -7817,6 +7882,12 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 			return s.hasContinuationCandidateWithDispatch(key, apiKeyID, exclude, filter, policy)
 		}
 		return s.hasDispatchCandidateWithDispatch(apiKeyID, exclude, filter, policy)
+	}
+	// 结构性候选为空的请求在池里根本没有归属（模型/渠道/分组/API Key 约束全不满足），
+	// 等满超时也不会冒出账号来，直接失败而不是把客户端挂住。账号只是忙或冷却时静态
+	// 候选依然存在，容量等待与「另一副本新增账号」的等待都不受影响。
+	if !s.hasStaticCandidateWithDispatch(apiKeyID, exclude, filter, policy) {
+		return nil, "", SessionAffinityGuard{}, nil
 	}
 	// Indexed/shadow also wait on an empty snapshot: another replica may add
 	// an account and notify this process through the durable outbox.

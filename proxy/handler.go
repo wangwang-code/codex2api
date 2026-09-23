@@ -1585,6 +1585,29 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	h.logUsage(input)
 }
 
+// logUnservedRequest 记录「池里没能给出账号」的请求（无可用账号、并发窗口已满）。
+// 这类请求没有任何账号参与，AccountID 记 0；其余字段照常填充，使它们出现在用量页与
+// 错误页，而不是彻底消失。status 用客户端实际收到的状态码，message 用客户端实际看到
+// 的文案，便于按文案对账。
+func (h *Handler) logUnservedRequest(c *gin.Context, endpoint, logModel, effectiveModel, message string, status int, stream bool, startedAt time.Time) {
+	durationMs := 0
+	if !startedAt.IsZero() {
+		durationMs = int(time.Since(startedAt).Milliseconds())
+	}
+	h.logUsageForRequest(c, &database.UsageLogInput{
+		Endpoint:          endpoint,
+		Model:             logModel,
+		EffectiveModel:    effectiveModel,
+		StatusCode:        status,
+		DurationMs:        durationMs,
+		Stream:            stream,
+		InboundEndpoint:   endpoint,
+		UpstreamEndpoint:  endpoint,
+		UpstreamErrorKind: "no_available_account",
+		ErrorMessage:      message,
+	})
+}
+
 // logContinueThinkingRounds 为思考截断续想中「被折叠隐藏」的上游轮次补记真实用量。
 // 每一轮续想都是一次独立的上游请求，各自产生真实 token 消耗；对客户端折叠成单响应
 // 后，最终成功轮的用量由本 attempt 收尾统一记账，这里补记除最终成功轮外的其余各轮
@@ -4123,15 +4146,20 @@ func (h *Handler) Responses(c *gin.Context) {
 			if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				setConcurrencySaturatedRetryAfter(c)
 				if isStream && writeCommittedResponsesRetryError(c, concurrencySaturatedMessageZH) {
+					h.logUnservedRequest(c, "/v1/responses", logModel, effectiveModel, concurrencySaturatedMessageZH, http.StatusServiceUnavailable, isStream, handlerStart)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, concurrencySaturatedError())
+				h.logUnservedRequest(c, "/v1/responses", logModel, effectiveModel, concurrencySaturatedMessageZH, http.StatusServiceUnavailable, isStream, handlerStart)
 				return
 			}
-			if isStream && writeCommittedResponsesRetryError(c, noAvailableAccountMessage(effectiveModel)) {
+			poolMessage := noAvailableAccountMessage(effectiveModel)
+			if isStream && writeCommittedResponsesRetryError(c, poolMessage) {
+				h.logUnservedRequest(c, "/v1/responses", logModel, effectiveModel, poolMessage, http.StatusServiceUnavailable, isStream, handlerStart)
 				return
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			h.logUnservedRequest(c, "/v1/responses", logModel, effectiveModel, poolMessage, http.StatusServiceUnavailable, isStream, handlerStart)
 			return
 		}
 		if attempt > 0 {
@@ -6738,6 +6766,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 // ChatCompletions 处理 OpenAI Chat Completions 请求，并在流式响应中发送协议保活。
 func (h *Handler) ChatCompletions(c *gin.Context) {
+	// 请求起始时间：账号选择阶段就可能失败（无可用账号 / 并发窗口已满），
+	// 那些分支也要把真实耗时记进用量日志。
+	handlerStart := time.Now()
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -6910,15 +6941,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				setConcurrencySaturatedRetryAfter(c)
 				if isStream && writeCommittedChatRetryError(c, concurrencySaturatedMessageZH) {
+					h.logUnservedRequest(c, "/v1/chat/completions", logModel, effectiveModel, concurrencySaturatedMessageZH, http.StatusServiceUnavailable, isStream, handlerStart)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, concurrencySaturatedError())
+				h.logUnservedRequest(c, "/v1/chat/completions", logModel, effectiveModel, concurrencySaturatedMessageZH, http.StatusServiceUnavailable, isStream, handlerStart)
 				return
 			}
-			if isStream && writeCommittedChatRetryError(c, noAvailableAccountMessage(effectiveModel)) {
+			poolMessage := noAvailableAccountMessage(effectiveModel)
+			if isStream && writeCommittedChatRetryError(c, poolMessage) {
+				h.logUnservedRequest(c, "/v1/chat/completions", logModel, effectiveModel, poolMessage, http.StatusServiceUnavailable, isStream, handlerStart)
 				return
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			h.logUnservedRequest(c, "/v1/chat/completions", logModel, effectiveModel, poolMessage, http.StatusServiceUnavailable, isStream, handlerStart)
 			return
 		}
 		if attempt > 0 {

@@ -97,6 +97,22 @@ func TestIndexedAvailabilityWaitWakesOnOutboxAccountInsert(t *testing.T) {
 		t.Fatalf("Store.Init: %v", err)
 	}
 
+	// 契约变更：池里连一个结构性候选都没有时，调度等待会立即失败（不再空挂 30s）。
+	// 因此先放一个「结构上可服务、但正在冷却」的账号，让等待者停在队列里，再验证
+	// outbox 插入的账号把它唤醒——本用例真正要守的是「跨副本新增账号能唤醒等待者」。
+	parkingID, err := db.InsertOpenAIResponsesAccount(ctx, "parking-account", map[string]interface{}{
+		"upstream_type": UpstreamOpenAIResponses,
+		"base_url":      "https://parking.example",
+		"api_key":       "sk-parking",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount(parking): %v", err)
+	}
+	waitForSchedulerProjection(t, func() bool { return store.FindByID(parkingID) != nil })
+	if parking := store.FindByID(parkingID); parking != nil {
+		store.MarkCooldown(parking, time.Minute, "outbox-wait-test")
+	}
+
 	result := make(chan *Account, 1)
 	go func() {
 		acc, _ := store.WaitForSessionAvailableWithDispatch(ctx, "", 10*time.Second, 0, nil, nil, DispatchPolicyStandard)

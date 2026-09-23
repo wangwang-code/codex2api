@@ -109,6 +109,7 @@ func TestSelectionSuccessPreservesRequestLifetime(t *testing.T) {
 func TestSelectionDeadlineStopsPoolWait(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
 	t.Cleanup(store.Stop)
+	parkSchedulerWaiterAccount(t, store)
 	h := &Handler{store: store}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
