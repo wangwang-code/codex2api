@@ -59,6 +59,26 @@ func TestCountRequestTextCharsCountsRunes(t *testing.T) {
 	}
 }
 
+// TestResolveStreamLimitBudgetEmptyMatchersMatchAnything 验证 api-keys / models
+// 留空即匹配任意：单流量网关不需要像 CPA 那样填具体 Key。
+func TestResolveStreamLimitBudgetEmptyMatchersMatchAnything(t *testing.T) {
+	restoreEnabled, restoreRules := streamLimitsEnabled, streamLimitRules
+	t.Cleanup(func() { streamLimitsEnabled, streamLimitRules = restoreEnabled, restoreRules })
+
+	streamLimitsEnabled = true
+	streamLimitRules = []streamLimitRule{{Name: "all", BaseChars: 100, MinChars: 100}}
+
+	for _, tc := range []struct{ apiKey, model string }{
+		{"sk-anything", "gpt-5.6-codex"},
+		{"", ""},
+		{"sk-other", "claude-sonnet-4-5"},
+	} {
+		if _, ok := resolveStreamLimitBudget(tc.apiKey, tc.model, 10); !ok {
+			t.Fatalf("api-keys/models 留空时应匹配任意请求，未命中 %+v", tc)
+		}
+	}
+}
+
 // TestResolveStreamLimitBudget 验证规则匹配与预算推导。
 func TestResolveStreamLimitBudget(t *testing.T) {
 	restoreEnabled, restoreRules := streamLimitsEnabled, streamLimitRules

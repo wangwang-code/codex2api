@@ -6834,7 +6834,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	// 上游流预算：命中规则时按输入长度推导输出上限，模型输出失控即中止。
 	// streamLimitBreached 跨 attempt 保持，一旦触发就不再换号重试（见 stream_limits.go）。
-	streamLimit := newStreamLimitStateForRequest(c, model, rawBody)
+	// 规则匹配用 logModel（客户端请求的模型名，与用量页 model 列一致），而不是映射后的
+	// model：操作者是照着客户端发的模型名配规则的，用映射后名字会静默不命中。
+	streamLimit := newStreamLimitStateForRequest(c, logModel, rawBody)
 	streamLimitBreached := false
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)

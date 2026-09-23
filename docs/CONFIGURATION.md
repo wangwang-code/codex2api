@@ -114,7 +114,7 @@ Codex2API 采用三层配置架构：
 | `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` | 否 | 空 | 未在下面列出的状态码使用的默认文案；留空表示这些状态码原样透出 |
 | `UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` | 否 | 空 | 状态码到文案的映射。`\|` 分隔的 `状态码=文案`，或 JSON 对象；`\|` 写法逐项还原转义 |
 | `STREAM_LIMITS_ENABLED` | 否 | `false` | 上游流预算总开关。开启后按规则匹配请求，限制单次上游流的输出内容字符数、墙钟时长与上游原始字节数，超出即中止并向客户端返回固定 payload |
-| `STREAM_LIMITS_RULES` | 否 | 空 | 规则列表（JSON 数组，按顺序匹配，第一条命中即生效）。字段：`name` / `api-keys` / `models` / `base-chars` / `chars-per-input-char` / `min-chars` / `max-chars` / `max-stream-duration` / `max-upstream-bytes` |
+| `STREAM_LIMITS_RULES` | 否 | 空 | 规则列表（JSON 数组，按顺序匹配，第一条命中即生效）。字段：`name` / `api-keys` / `models` / `base-chars` / `chars-per-input-char` / `min-chars` / `max-chars` / `max-stream-duration` / `max-upstream-bytes`。`api-keys` 与 `models` **留空即匹配任意**，不是必填；`models` 匹配的是客户端请求的模型名（与用量页 `model` 列一致），不是网关模型映射后的名字 |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 
