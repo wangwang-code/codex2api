@@ -200,3 +200,99 @@ func TestSchedulerPriorityRangePreservesNegativeFallback(t *testing.T) {
 		t.Fatalf("上越界应钳到 100，实际 %d", got)
 	}
 }
+
+// newTransitionTestHandler 构造「N 个 codex 号 + 1 个中转兜底号」的 handler，
+// 用于实测 codex 池整体失效时的切换成本。
+func newTransitionTestHandler(t *testing.T, codexCount, maxRetries int) (*Handler, *gin.Engine, *auth.Account) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	previousSettings := CurrentRuntimeSettings()
+	settings := DefaultRuntimeSettings()
+	settings.CodexForceWebsocket = false
+	ApplyRuntimeSettings(settings)
+	t.Cleanup(func() { ApplyRuntimeSettings(previousSettings) })
+
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "transition.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Key: modelQuotaTestKey, Name: "transition",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 4, MaxRetries: maxRetries, MaxRateLimitRetries: 0})
+	t.Cleanup(store.Stop)
+
+	for i := 0; i < codexCount; i++ {
+		account := &auth.Account{DBID: int64(i + 1), AccessToken: "codex-token", PlanType: "pro", Models: []string{"gpt-6-astra"}}
+		account.SetSchedulerPriority(10)
+		store.AddAccount(account)
+	}
+	relay := &auth.Account{
+		DBID: 100, UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL: "http://127.0.0.1:1", APIKey: "sk-relay", PlanType: "api",
+		Models: []string{"gpt-6-astra"},
+	}
+	relay.SetSchedulerPriority(-1)
+	store.AddAccount(relay)
+
+	h := NewHandler(store, db, &config.Config{}, nil)
+	router := gin.New()
+	h.RegisterRoutes(router)
+	return h, router, relay
+}
+
+// TestPriorityFallbackTransitionCostsOneFailedRequest 实测「codex 池整体失效」的切换成本。
+//
+// 3 个 codex 号全部返回 401、中转号优先级 -1、max_retries=2（默认）：一笔请求有 3 次尝试，
+// 正好把 3 个号各打一次 401 并逐个冷却，于是第一笔失败；三个号都已退出调度，第二笔直接
+// 落到中转。也就是说切换成本是「每个 (max_retries+1) 个 codex 号烧掉一笔失败请求」。
+func TestPriorityFallbackTransitionCostsOneFailedRequest(t *testing.T) {
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	var codexHits atomic.Int32
+	codexUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		codexHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"Provided authentication token is expired.","type":"invalid_request_error","code":"token_expired"}}`)
+	}))
+	t.Cleanup(codexUpstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: codexUpstream.URL, PlatformName: "transition-test"})
+
+	var relayHits atomic.Int32
+	relayUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, modelQuotaSSE)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(relayUpstream.Close)
+
+	h, router, relay := newTransitionTestHandler(t, 3, 2)
+	// 把中转号指到能成功的假上游（账号在构造时占位，这里补上真实地址）。
+	h.store.FindByID(relay.DBID).BaseURL = relayUpstream.URL
+	body := `{"model":"gpt-6-astra","messages":[{"role":"user","content":"hi"}]}`
+
+	first := performModelQuotaRequest(router, "/v1/chat/completions", body)
+	firstCodexHits := codexHits.Load()
+	t.Logf("第一笔: status=%d codex命中=%d relay命中=%d", first.Code, firstCodexHits, relayHits.Load())
+
+	second := performModelQuotaRequest(router, "/v1/chat/completions", body)
+	t.Logf("第二笔: status=%d codex命中=%d relay命中=%d", second.Code, codexHits.Load(), relayHits.Load())
+
+	if second.Code != http.StatusOK {
+		t.Fatalf("codex 号全部退出调度后，第二笔应当由中转兜底成功: status=%d body=%q", second.Code, second.Body.String())
+	}
+	if got := servedAccountID(t, h); got != relay.DBID {
+		t.Fatalf("第二笔应当由中转号 %d 服务，实际 account_id=%d", relay.DBID, got)
+	}
+	if relayHits.Load() == 0 {
+		t.Fatal("中转上游一次都没被调用")
+	}
+}
