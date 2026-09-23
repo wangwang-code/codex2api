@@ -949,10 +949,10 @@ func (h *Handler) Messages(c *gin.Context) {
 					DurationMs: durationMs, InboundEndpoint: "/v1/messages", UpstreamEndpoint: upstreamEndpoint,
 					Stream: isStream, ViaWebsocket: useWebsocket, UpstreamErrorKind: "client_compatibility", ErrorMessage: message,
 				})
-				if isStream && writeCommittedAnthropicRetryError(c, ErrorTypeInvalidRequest, message) {
+				if isStream && writeCommittedAnthropicRetryError(c, ErrorTypeInvalidRequest, rewriteUpstreamErrorText(resp.StatusCode, message)) {
 					return
 				}
-				sendAnthropicError(c, http.StatusBadRequest, ErrorTypeInvalidRequest, message)
+				sendAnthropicError(c, http.StatusBadRequest, ErrorTypeInvalidRequest, rewriteUpstreamErrorText(resp.StatusCode, message))
 				return
 			}
 			// Antigravity 的 401 是过期 access token，刷新后同号重试一次即可恢复
@@ -1052,7 +1052,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				return
 			}
 			errType := mapHTTPStatusToAnthropicError(resp.StatusCode)
-			msg := usageLogErrorMessage(resp.StatusCode, errBody)
+			msg := upstreamClientErrorMessage(resp.StatusCode, errBody)
 			if msg == "" || msg == fmt.Sprintf("HTTP %d", resp.StatusCode) {
 				msg = fmt.Sprintf("Upstream returned status %d", resp.StatusCode)
 			}

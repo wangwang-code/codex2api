@@ -1707,7 +1707,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					return
 				}
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+					if stream && writeCommittedResponsesRetryError(c, upstreamClientErrorMessage(lastStatusCode, lastBody)) {
 						return
 					}
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1882,7 +1882,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				}
 				continue
 			}
-			if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(resp.StatusCode, errBody)) {
+			if stream && writeCommittedResponsesRetryError(c, upstreamClientErrorMessage(resp.StatusCode, errBody)) {
 				return
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -2136,7 +2136,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	}
 	// Exhausted all attempts.
 	if lastStatusCode > 0 && len(lastBody) > 0 {
-		if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+		if stream && writeCommittedResponsesRetryError(c, upstreamClientErrorMessage(lastStatusCode, lastBody)) {
 			return
 		}
 		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)

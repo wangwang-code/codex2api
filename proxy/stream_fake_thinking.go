@@ -38,7 +38,7 @@ const (
 )
 
 // 配置变量形式与 downstreamSSEKeepaliveInterval 一致：包初始化时读取进程环境变量，
-// config.Load 读取 .env 后由 ConfigureDownstreamKeepaliveFromEnv 再刷新一次。
+// config.Load 读取 .env 后由 ConfigureFromEnv 再刷新一次。
 var (
 	streamFakeThinkingEnabled   = streamFakeThinkingEnabledFromEnv()
 	streamFakeThinkingImmediate = streamFakeThinkingImmediateFromEnv()
@@ -68,7 +68,7 @@ func streamFakeThinkingTextFromEnv() string {
 // 值与 CPA 的 YAML 双引号语义对齐：`\n` 等转义会还原成真实字符，首尾空白原样保留
 // （线上文案靠开头的 `\n` 换行，不能被裁掉）；纯空白视为未配置。
 func parseStreamFakeThinkingText(raw string) string {
-	value := decodeStreamEscapes(raw)
+	value := decodeEnvEscapes(raw)
 	if strings.TrimSpace(value) == "" {
 		return ""
 	}
@@ -104,47 +104,9 @@ func parseStreamFakeThinkingTexts(raw string) []string {
 	}
 	parts := strings.Split(raw, "|")
 	for i := range parts {
-		parts[i] = decodeStreamEscapes(parts[i])
+		parts[i] = decodeEnvEscapes(parts[i])
 	}
 	return parts
-}
-
-// decodeStreamEscapes 把 `\n` / `\r` / `\t` / `\\` / `\"` 等转义还原成真实字符，
-// 让 CPA 的 YAML 文案可以直接平移到 .env（.env 不做转义，必须由这里补齐）。
-// 无法识别的转义原样保留，避免误伤文案里正常的反斜杠。
-func decodeStreamEscapes(value string) string {
-	if !strings.Contains(value, `\`) {
-		return value
-	}
-	var out strings.Builder
-	out.Grow(len(value))
-	for i := 0; i < len(value); i++ {
-		if value[i] != '\\' || i+1 >= len(value) {
-			out.WriteByte(value[i])
-			continue
-		}
-		i++
-		switch value[i] {
-		case 'n':
-			out.WriteByte('\n')
-		case 'r':
-			out.WriteByte('\r')
-		case 't':
-			out.WriteByte('\t')
-		case '\\':
-			out.WriteByte('\\')
-		case '"':
-			out.WriteByte('"')
-		case '\'':
-			out.WriteByte('\'')
-		case '0':
-			out.WriteByte(0)
-		default:
-			out.WriteByte('\\')
-			out.WriteByte(value[i])
-		}
-	}
-	return out.String()
 }
 
 // ConfigureStreamFakeThinkingFromEnv 在 config.Load 读取 .env 后刷新伪装思考配置。
@@ -155,22 +117,7 @@ func ConfigureStreamFakeThinkingFromEnv() {
 	streamFakeThinkingTexts = streamFakeThinkingTextsFromEnv()
 }
 
-// boolFromEnv 解析布尔型环境变量；无法识别时沿用默认值并记录日志。
-func boolFromEnv(key string, fallback bool) bool {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
-	}
-	switch strings.ToLower(raw) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		log.Printf("[Config] %s=%q 非法，沿用默认 %t", key, raw, fallback)
-		return fallback
-	}
-}
+// boolFromEnv 与 decodeEnvEscapes 见 env_config.go（与上游错误改写共用同一套语义）。
 
 // fakeThinkingState 在一次流式请求内由 handler 与保活写入方共享。
 // handler 在首个真实内容落地时置位 firstContentSeen，保活写入方据此决定继续

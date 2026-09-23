@@ -664,11 +664,16 @@ func effectiveRequestModel(body []byte, fallback string) string {
 	return strings.TrimSpace(fallback)
 }
 
+// noAvailableAccountMessage 返回「无可用账号」时给客户端看的文案。
+// 该分支对外恒为 503，所以这里直接套用上游错误改写：操作者按状态码配置 503 时，
+// 「上游故障」与「池内无货」对下游是同一句文案，不会因为池状态不同而抖动。
+// 文案本身由网关拼装，不含上游身份。
 func noAvailableAccountMessage(model string) string {
+	message := "无可用账号，请稍后重试"
 	if isProOnlyModel(model) {
-		return "无可用付费或未知套餐账号，gpt-5.3-codex-spark 已排除明确 free/api 账号"
+		message = "无可用付费或未知套餐账号，gpt-5.3-codex-spark 已排除明确 free/api 账号"
 	}
-	return "无可用账号，请稍后重试"
+	return rewriteUpstreamErrorText(http.StatusServiceUnavailable, message)
 }
 
 func noAvailableAccountError(model string) gin.H {
@@ -967,6 +972,7 @@ func (h *Handler) sendGrokNativeHTTPError(c *gin.Context, protocol GrokProtocol,
 	if message == "" {
 		message = fmt.Sprintf("Upstream returned status %d", status)
 	}
+	message = rewriteUpstreamErrorText(status, message)
 	if retryKeepaliveCommitted(c) {
 		switch auth.NormalizeGrokProtocol(string(protocol)) {
 		case GrokProtocolMessages:
@@ -4073,7 +4079,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if lastRetryAfter != "" {
 					c.Header("Retry-After", lastRetryAfter)
 				}
-				if isStream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+				if isStream && writeCommittedResponsesRetryError(c, upstreamClientErrorMessage(lastStatusCode, lastBody)) {
 					return
 				}
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -4424,7 +4430,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if retryAfter != "" {
 					c.Header("Retry-After", retryAfter)
 				}
-				if isStream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(resp.StatusCode, errBody)) {
+				if isStream && writeCommittedResponsesRetryError(c, upstreamClientErrorMessage(resp.StatusCode, errBody)) {
 					return
 				}
 				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -4845,6 +4851,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
 				h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 			}
+			// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
+			outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
 			if isStream && outcome.terminalLocal {
 				writeContinuousRetryLocalResponsesError(c)
 			} else if isStream && abortedForHTTPError && !downstreamWrote {
@@ -5189,7 +5197,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if retryAfter != "" {
 				c.Header("Retry-After", retryAfter)
 			}
-			if isStream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(resp.StatusCode, errBody)) {
+			if isStream && writeCommittedResponsesRetryError(c, upstreamClientErrorMessage(resp.StatusCode, errBody)) {
 				return
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -5752,6 +5760,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 
+		// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
+		outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
 		if isStream && outcome.terminalLocal {
 			writeContinuousRetryLocalResponsesError(c)
 		} else if isStream && abortedForHTTPError && !downstreamWrote {
@@ -6883,7 +6893,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return
 			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				if isStream && writeCommittedChatRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+				if isStream && writeCommittedChatRetryError(c, upstreamClientErrorMessage(lastStatusCode, lastBody)) {
 					return
 				}
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -7187,7 +7197,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				continue
 			}
 
-			if isStream && writeCommittedChatRetryError(c, usageLogErrorMessage(resp.StatusCode, errBody)) {
+			if isStream && writeCommittedChatRetryError(c, upstreamClientErrorMessage(resp.StatusCode, errBody)) {
 				return
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
@@ -7704,6 +7714,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 			}
 		}
+		// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
+		outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
 		if isStream && outcome.terminalLocal {
 			writeContinuousRetryLocalChatError(c)
 		} else if isStream && abortedForHTTPError && !downstreamWrote {
@@ -8795,6 +8807,8 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 	if message == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
 		message = fmt.Sprintf("Upstream returned status %d", statusCode)
 	}
+	// 上游错误消息改写：这条出口会把上游 message 原样透给客户端，必须拦在这里。
+	message = rewriteUpstreamErrorText(statusCode, message)
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
 			"message": message,
@@ -8830,6 +8844,17 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 	if !claimContinuousRetryTerminal(c, continuousRetryProtocolOpenAI) {
 		return
 	}
+	// 池级 503 的统一出口。这些文案由网关拼装（部分会附上游原文，如工作区停用原因），
+	// 因此同样套用上游错误改写：操作者按 503 配置文案后，所有「池不可用」分支对下游
+	// 是同一句话，不会因为池状态不同而抖动。
+	writePoolUnavailable := func(payload gin.H) {
+		if errInfo, ok := payload["error"].(gin.H); ok {
+			if message, ok := errInfo["message"].(string); ok {
+				errInfo["message"] = rewriteUpstreamErrorText(http.StatusServiceUnavailable, message)
+			}
+		}
+		c.JSON(http.StatusServiceUnavailable, payload)
+	}
 	if details, ok := parseUsageLimitDetails(body); ok {
 		if details.resetsInSeconds > 0 {
 			c.Header("Retry-After", fmt.Sprintf("%d", details.resetsInSeconds))
@@ -8854,7 +8879,7 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 		if details.resetsInSeconds != 0 {
 			errInfo["resets_in_seconds"] = details.resetsInSeconds
 		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errInfo})
+		writePoolUnavailable(gin.H{"error": errInfo})
 		return
 	}
 
@@ -8862,7 +8887,7 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 	// 若原样以 401 透传，客户端会误判自己的凭证失效（issue #323）。改写为 503 池级
 	// 错误，用独立 code/type 与客户端鉴权失败（invalid_api_key）明确区分。
 	if statusCode == http.StatusUnauthorized && !isMissingScopeUnauthorized(body) {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
+		writePoolUnavailable(gin.H{
 			"error": gin.H{
 				"message": "账号池暂无可用账号（上游账号鉴权失效），请稍后重试",
 				"type":    "server_error",
@@ -8880,7 +8905,7 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 		if c.Writer.Header().Get("Retry-After") == "" {
 			c.Header("Retry-After", "30")
 		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{
+		writePoolUnavailable(gin.H{
 			"error": gin.H{
 				"message": deactivatedPoolErrorMessage(strings.TrimSpace(string(body))),
 				"type":    "server_error",
@@ -8894,7 +8919,7 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 	// 同样是账号侧问题：重试已换过号仍拿到 403 说明池内暂无可用账号。原样透传 403 会让
 	// 客户端（如 Claude Code）误判为自身无权限而直接停工（issue #396），改写为 503 池级错误。
 	if statusCode == http.StatusForbidden {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
+		writePoolUnavailable(gin.H{
 			"error": gin.H{
 				"message": "账号池暂无可用账号（上游账号被拒绝访问：额度/套餐或工作区受限），请稍后重试",
 				"type":    "server_error",

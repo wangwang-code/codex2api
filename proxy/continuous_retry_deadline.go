@@ -409,6 +409,11 @@ func writeContinuousRetryLastFailure(c *gin.Context, protocol continuousRetryHTT
 		message = fmt.Sprintf("Upstream returned HTTP %d", status)
 	}
 	code := fmt.Sprintf("upstream_%d", status)
+	// 上游错误消息改写：命中后一律走网关自建的标准错误信封，不再透传上游原始 body。
+	rewrittenMessage, rewriteMatched := upstreamErrorRewriteMessage(status)
+	if rewriteMatched {
+		message = rewrittenMessage
+	}
 	if retryKeepaliveCommitted(c) {
 		var payload []byte
 		switch protocol {
@@ -431,7 +436,7 @@ func writeContinuousRetryLastFailure(c *gin.Context, protocol continuousRetryHTT
 		c.JSON(status, gin.H{"type": "error", "error": gin.H{"type": mapHTTPStatusToAnthropicError(status), "message": message}})
 		return
 	}
-	if len(failure.body) > 0 && json.Valid(failure.body) {
+	if !rewriteMatched && len(failure.body) > 0 && json.Valid(failure.body) {
 		contentType := failure.contentType
 		if contentType == "" {
 			contentType = "application/json"

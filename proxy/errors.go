@@ -328,6 +328,16 @@ func ErrorToGinResponse(c *gin.Context, err error) {
 
 	var e *Error
 	if errors.As(err, &e) {
+		// 上游错误消息改写：命中配置状态码时只暴露配置文案（type/code 是网关自有
+		// 常量，不含上游身份，保留以维持下游的重试判定兼容）。
+		if message, ok := upstreamErrorRewriteMessage(e.HTTPStatus); ok {
+			c.JSON(e.HTTPStatus, gin.H{"error": gin.H{
+				"message": message,
+				"type":    e.Type,
+				"code":    e.Code,
+			}})
+			return
+		}
 		c.JSON(e.HTTPStatus, e.ToGinH())
 		return
 	}

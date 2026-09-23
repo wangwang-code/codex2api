@@ -23,13 +23,14 @@ func downstreamSSEKeepaliveIntervalFromEnv() time.Duration {
 	return durationFromEnv("DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL", defaultDownstreamSSEKeepaliveInterval)
 }
 
-// ConfigureDownstreamKeepaliveFromEnv 在 config.Load 读取 .env 后刷新保活配置。
-// 进程环境变量仍会在包初始化时生效。
-func ConfigureDownstreamKeepaliveFromEnv() {
+// ConfigureFromEnv 在 config.Load 读取 .env 后刷新所有由环境变量派生的网关配置
+// （保活周期、伪装思考、上游错误改写）。进程环境变量仍会在包初始化时生效。
+func ConfigureFromEnv() {
 	downstreamSSEKeepaliveInterval = downstreamSSEKeepaliveIntervalFromEnv()
 	continuousRetryKeepaliveInterval = downstreamSSEKeepaliveInterval
 	downstreamWSKeepaliveInterval = downstreamWSKeepaliveIntervalFromEnv()
 	ConfigureStreamFakeThinkingFromEnv()
+	ConfigureUpstreamErrorRewriteFromEnv()
 }
 
 // startDownstreamSSEKeepalive 周期执行 writeKeepalive，直到请求取消、写失败
