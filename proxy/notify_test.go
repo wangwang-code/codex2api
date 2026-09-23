@@ -287,6 +287,52 @@ func TestCodexPoolDegradedOnlyAfterLastAccount(t *testing.T) {
 	}
 }
 
+// TestCodexPoolBusyIsNotDegraded 验证「忙」不算「降级」：把所有 codex 号的并发槽位占满
+// 时，池子并没有退出服务，不该喊降级。
+//
+// 守的是判定口径——统计在服账号只看「账号是否退出服务」（状态 / 健康档位 / 冷却 /
+// 用量窗口），不看负载。将来若有人把负载相关条件塞进这个判据，这条会拦住。
+//
+// 注：实测把「并发容量 > 0」加进判据并不会让本用例失败——容量不等于剩余槽位，「忙」体现
+// 在选择循环的 load >= limit 上。所以这条是意图守卫，不是某个具体实现的回归。
+func TestCodexPoolBusyIsNotDegraded(t *testing.T) {
+	collector, webhook := newNotifyWebhook(t)
+	withNotifyWebhook(t, webhook.URL, "json")
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, modelQuotaSSE)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(healthy.Close)
+
+	h, _ := newNotifyTestHandler(t, 2, healthy.URL)
+
+	// 占满所有 codex 号的并发槽位（Next 会占槽，直到没有可派发账号为止）。
+	var held []*auth.Account
+	for account := h.store.Next(); account != nil; account = h.store.Next() {
+		held = append(held, account)
+	}
+	t.Cleanup(func() {
+		for _, account := range held {
+			h.store.Release(account)
+		}
+	})
+	if len(held) == 0 {
+		t.Fatal("没能占住任何槽位，用例前提不成立")
+	}
+	t.Logf("占住 %d 个并发槽位", len(held))
+
+	h.refreshCodexPoolState("unit-test-busy")
+	time.Sleep(150 * time.Millisecond)
+
+	if bodies := collector.all(); containsSubstring(bodies, "服务降级") {
+		t.Fatalf("账号只是忙、并未退出服务，不该喊降级，实际: %v", bodies)
+	}
+}
+
 // TestNotifyDisabledSendsNothing 验证未配置 webhook 时一条通知都不发。
 func TestNotifyDisabledSendsNothing(t *testing.T) {
 	collector, webhook := newNotifyWebhook(t)

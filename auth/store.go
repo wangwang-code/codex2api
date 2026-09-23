@@ -7623,15 +7623,18 @@ func (s *Store) hasStaticCandidateWithDispatch(apiKeyID int64, exclude map[int64
 	return false
 }
 
-// CountDispatchableAccounts 返回当前可派发的账号数：结构可服务、未冷却、且还有并发额度，
-// filter 为 nil 时统计全部。用于「某类账号整体不可用」这类池级判断（例如 codex 池打空后
-// 通知服务降级），不涉及 API Key 归属，因此与选择路径的 hasDispatchCandidate 分开实现。
-func (s *Store) CountDispatchableAccounts(filter AccountFilter) int {
+// CountServiceableAccounts 返回当前「在服」的账号数：结构可服务且未被冷却/限流拦住，
+// filter 为 nil 时统计全部。用于「某类账号是否整体退出服务」这类池级判断（例如 codex 池
+// 打空后通知服务降级）。
+//
+// 刻意**不看并发槽位**：槽位占满是「忙」，不是「不可用」——池子打满时所有账号都可能瞬时
+// 没有空闲槽位，把它算成不可用会误报降级。判据与 IsAvailable 一致（状态、档位、冷却、
+// 用量窗口），与选择路径的 hasDispatchCandidate（含槽位）分开实现。
+func (s *Store) CountServiceableAccounts(filter AccountFilter) int {
 	if s == nil {
 		return 0
 	}
 	filter = s.withUsableEgressFilter(filter)
-	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	count := 0
 	for _, acc := range s.accountSnapshotAccounts() {
 		if acc == nil {
@@ -7646,9 +7649,7 @@ func (s *Store) CountDispatchableAccounts(filter AccountFilter) int {
 		if filter != nil && !filter(acc) {
 			continue
 		}
-		if _, _, _, limit := acc.schedulerSnapshotForPolicy(maxConcurrency, DispatchPolicyStandard); limit > 0 {
-			count++
-		}
+		count++
 	}
 	return count
 }

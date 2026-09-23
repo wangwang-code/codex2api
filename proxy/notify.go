@@ -179,7 +179,7 @@ func (h *Handler) refreshCodexPoolState(reason string) {
 	if !notifyEnabled() || h == nil || h.store == nil {
 		return
 	}
-	available := h.store.CountDispatchableAccounts(func(account *auth.Account) bool {
+	available := h.store.CountServiceableAccounts(func(account *auth.Account) bool {
 		return isCodexPoolAccount(account)
 	})
 	degraded := available == 0
