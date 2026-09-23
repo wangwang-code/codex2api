@@ -141,6 +141,9 @@ type continuousRetrySSEKeepaliveOptions struct {
 	payloadFunc func() string
 	// primeFirstBeat 让首个心跳在第一次等待循环里立即落地（抢先开流）。
 	primeFirstBeat bool
+	// onWrite 在每次成功写出心跳后调用。请求卡顿看门狗用它判定「下游已经有字节」，
+	// 从而只在真正零字节的窗口内布防。
+	onWrite func()
 }
 
 // installContinuousRetrySSEKeepaliveWithOptions 安装带指定内容类型和心跳载荷的请求保活。
@@ -184,6 +187,9 @@ func installContinuousRetrySSEKeepaliveWithOptions(c *gin.Context, stream bool, 
 		}
 		if flusher, ok := responseWriter.(http.Flusher); ok {
 			flusher.Flush()
+		}
+		if options.onWrite != nil {
+			options.onWrite()
 		}
 		return nil
 	}, cancel: cancel}

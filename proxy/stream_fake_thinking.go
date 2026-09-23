@@ -249,15 +249,21 @@ func buildFakeThinkingFrame(model, text string) string {
 }
 
 // installStreamFakeThinkingKeepalive 安装带假思考载荷的下游保活。
-// state 为 nil 或非流式时退回原有的纯注释保活，行为不变。
-func installStreamFakeThinkingKeepalive(c *gin.Context, stream bool, state *fakeThinkingState) func() {
-	if !stream || state == nil {
+// state 为 nil（伪装思考关闭）时退回原有的纯注释心跳，行为不变。
+// onWrite 在每次心跳写出后调用（可为 nil），供请求卡顿看门狗判定下游已有字节——
+// 伪装思考关闭时也必须接上，否则长等待期间的心跳不会被看门狗看见。
+func installStreamFakeThinkingKeepalive(c *gin.Context, stream bool, state *fakeThinkingState, onWrite func()) func() {
+	if !stream {
 		return installContinuousRetrySSEKeepalive(c, stream, "text/event-stream")
 	}
-	return installContinuousRetrySSEKeepaliveWithOptions(c, stream, continuousRetrySSEKeepaliveOptions{
-		contentType:    "text/event-stream",
-		payload:        continuousRetryKeepaliveComment,
-		payloadFunc:    state.payload,
-		primeFirstBeat: state.shouldPrimeFirstBeat(),
-	})
+	options := continuousRetrySSEKeepaliveOptions{
+		contentType: "text/event-stream",
+		payload:     continuousRetryKeepaliveComment,
+		onWrite:     onWrite,
+	}
+	if state != nil {
+		options.payloadFunc = state.payload
+		options.primeFirstBeat = state.shouldPrimeFirstBeat()
+	}
+	return installContinuousRetrySSEKeepaliveWithOptions(c, stream, options)
 }

@@ -6838,6 +6838,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	// 只有流式请求才可能「连接活着但零 SSE」；非流式本来就要等完整响应，不参与布防。
+	phase.setStream(isStream)
 	// 上游流预算：命中规则时按输入长度推导输出上限，模型输出失控即中止。
 	// streamLimitBreached 跨 attempt 保持，一旦触发就不再换号重试（见 stream_limits.go）。
 	// 规则匹配用 logModel（客户端请求的模型名，与用量页 model 列一致），而不是映射后的
@@ -6894,7 +6896,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 流式时，把保活载荷换成可配置的假思考帧——首帧在开流时立即发出，之后每次
 	// 心跳按序附加一条文案；首个上游真实内容到达后自动退回纯注释心跳。
 	fakeThinking := newFakeThinkingStateForChat(responseModel)
-	stopRetryKeepalive := installStreamFakeThinkingKeepalive(c, isStream, fakeThinking)
+	stopRetryKeepalive := installStreamFakeThinkingKeepalive(c, isStream, fakeThinking, phase.markOutput)
 	defer stopRetryKeepalive()
 	activateContinuousRetryKeepalive(c.Request.Context())
 
@@ -7427,6 +7429,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+				phase.markOutput()
 				if streamLimit != nil && streamLimit.observe(len(data), upstreamContentRunes(eventType, parsed)) {
 					streamLimitBreached = true
 					return false
@@ -7601,6 +7604,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				outputCollector.Add(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
+				phase.markOutput()
 				if streamLimit != nil && streamLimit.observe(len(data), upstreamContentRunes(eventType, parsed)) {
 					streamLimitBreached = true
 					return false

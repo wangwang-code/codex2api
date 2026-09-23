@@ -26,21 +26,24 @@ import (
 // 取 10s 起是为了和默认首字超时量级对齐——正常请求不会在这里被误报。
 var requestStallWatchpoints = []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second}
 
-// 预工作阶段的名称。走完这些阶段后保活就生效了，客户端会开始收到字节，看门狗随即收工。
+// 预工作阶段的名称，仅用于日志定位。
 const (
 	phaseReadBody      = "read_body"
 	phaseValidate      = "validate"
 	phaseTranslate     = "translate"
 	phaseQuota         = "quota_admission"
 	phaseAccountFilter = "account_filter"
-	// phaseWaitingUpstream 是保活安装并激活之后：此后下游至少会收到抢先假思考首帧或
-	// 心跳，不再是「完全没有字节」的场景，看门狗停止。
+	// phaseWaitingUpstream 是保活安装并激活之后。注意它**不等于**下游已有字节：
+	// 之后还有代理解析、亲和绑定、账号选择等步骤同样不写下游，真正的分界是第一个
+	// 下游字节写出（见 markOutput）。
 	phaseWaitingUpstream = "waiting_upstream"
 )
 
 type requestPhaseTracker struct {
-	phase atomic.Value // string
-	model atomic.Value // string
+	phase  atomic.Value // string
+	model  atomic.Value // string
+	stream atomic.Bool  // 是否流式请求：非流式没有 SSE 保活，不参与布防
+	output atomic.Bool  // 下游是否已经写出过字节
 }
 
 func newRequestPhaseTracker() *requestPhaseTracker {
@@ -61,6 +64,23 @@ func (t *requestPhaseTracker) setModel(model string) {
 		return
 	}
 	t.model.Store(model)
+}
+
+// setStream 标记是否流式请求。只有流式请求才可能「连接活着但零 SSE」——非流式本来
+// 就要等完整响应，长时间没有字节是正常的，不参与布防。
+func (t *requestPhaseTracker) setStream(stream bool) {
+	if t == nil {
+		return
+	}
+	t.stream.Store(stream)
+}
+
+// markOutput 标记下游已经产出过字节。由保活写出与上游事件回调调用。
+func (t *requestPhaseTracker) markOutput() {
+	if t == nil {
+		return
+	}
+	t.output.Store(true)
 }
 
 func (t *requestPhaseTracker) current() string {
@@ -87,13 +107,15 @@ func (t *requestPhaseTracker) currentModel() string {
 	return ""
 }
 
-// armed 报告请求是否还处在「下游完全没有字节」的预工作窗口内。
+// armed 报告请求是否还处在「流式请求、但下游一个字节都没有」的状态。
+//
+// 刻意用「是否已有下游字节」而不是「是否已过某个阶段」来判断：保活安装之后到第一次
+// 心跳之间（代理解析、亲和绑定、账号选择）同样不写下游，用阶段判断会漏掉这段。
 func (t *requestPhaseTracker) armed() bool {
-	switch t.current() {
-	case phaseReadBody, phaseValidate, phaseTranslate, phaseQuota, phaseAccountFilter:
-		return true
+	if t == nil {
+		return false
 	}
-	return false
+	return t.stream.Load() && !t.output.Load()
 }
 
 // watchRequestStall 在请求迟迟没有任何下游产出时把当前阶段打进日志，请求结束即退出。
@@ -121,8 +143,8 @@ func watchRequestStall(ctx context.Context, endpoint string, tracker *requestPha
 				return
 			}
 			log.Printf("[STALL] %s 已 %.0fs 未产出任何下游字节，当前阶段=%s（model=%s）；"+
-				"该阶段在保活生效之前，所以既没有心跳也没有抢先假思考，属预期表现而非故障——"+
-				"要定位的是这一阶段为何没有返回",
+				"该请求是流式，正常应当在保活首次心跳（含抢先假思考首帧）时就写出字节，"+
+				"所以这里要定位的是「当前阶段为何没有返回」",
 				endpoint, time.Since(startedAt).Seconds(), tracker.current(), tracker.currentModel())
 		}
 	}()

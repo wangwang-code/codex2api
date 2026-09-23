@@ -44,22 +44,33 @@ func (w *writerFunc) Write(p []byte) (int, error) {
 	return w.buffer.Write(p)
 }
 
-// TestRequestPhaseTrackerArmedWindow 验证看门狗只在「下游完全没有字节」的预工作窗口内生效。
+// TestRequestPhaseTrackerArmedWindow 验证看门狗只在「流式请求 + 下游一个字节都没有」
+// 时布防。
+//
+// 关键点：布防边界是「是否已有下游字节」而不是「是否已过某个阶段」——保活安装之后到
+// 第一次心跳之间（代理解析、亲和绑定、账号选择）同样不写下游，用阶段判断会漏掉这段。
 func TestRequestPhaseTrackerArmedWindow(t *testing.T) {
 	tracker := newRequestPhaseTracker()
-	if tracker.current() != phaseReadBody || !tracker.armed() {
-		t.Fatalf("初始阶段 = %q armed=%t，应处于读体阶段且已布防", tracker.current(), tracker.armed())
+	if tracker.armed() {
+		t.Fatal("未标记是否流式前不应布防")
 	}
-	for _, phase := range []string{phaseValidate, phaseTranslate, phaseQuota, phaseAccountFilter} {
+	tracker.setStream(false)
+	if tracker.armed() {
+		t.Fatal("非流式请求本来就要等完整响应，不参与布防")
+	}
+	tracker.setStream(true)
+	if !tracker.armed() {
+		t.Fatal("流式请求在没有任何下游字节时应当布防")
+	}
+	for _, phase := range []string{phaseValidate, phaseTranslate, phaseQuota, phaseAccountFilter, phaseWaitingUpstream} {
 		tracker.set(phase)
 		if !tracker.armed() {
-			t.Fatalf("阶段 %q 仍属预工作窗口，应当布防", phase)
+			t.Fatalf("阶段 %q 时仍未有下游字节，应当继续布防", phase)
 		}
 	}
-	// 保活生效之后下游必然有字节（首帧或心跳），看门狗必须收工，否则长流会被误报。
-	tracker.set(phaseWaitingUpstream)
+	tracker.markOutput()
 	if tracker.armed() {
-		t.Fatalf("阶段 %q 之后不应当布防", phaseWaitingUpstream)
+		t.Fatal("下游已有字节后不应再布防，否则几十秒的正常长流会被误报")
 	}
 	tracker.setModel("gpt-5.6-codex")
 	if got := tracker.currentModel(); got != "gpt-5.6-codex" {
@@ -67,12 +78,13 @@ func TestRequestPhaseTrackerArmedWindow(t *testing.T) {
 	}
 }
 
-// TestRequestStallWatchdogLogsPreOutputPhase 验证请求卡在预工作阶段时会打出阶段快照。
-func TestRequestStallWatchdogLogsPreOutputPhase(t *testing.T) {
+// TestRequestStallWatchdogLogsCurrentPhase 验证请求卡在零字节状态时会打出阶段快照。
+func TestRequestStallWatchdogLogsCurrentPhase(t *testing.T) {
 	withStallWatchpoints(t, 10*time.Millisecond)
 	readLog := captureLog(t)
 
 	tracker := newRequestPhaseTracker()
+	tracker.setStream(true)
 	tracker.set(phaseQuota)
 	tracker.setModel("gpt-5.6-codex")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -88,20 +100,22 @@ func TestRequestStallWatchdogLogsPreOutputPhase(t *testing.T) {
 	}
 	output := readLog()
 	if !strings.Contains(output, "[STALL]") {
-		t.Fatalf("卡在预工作阶段时应当打出 STALL 快照，实际日志: %q", output)
+		t.Fatalf("零字节状态应当打出 STALL 快照，实际日志: %q", output)
 	}
 	if !strings.Contains(output, phaseQuota) || !strings.Contains(output, "gpt-5.6-codex") {
 		t.Fatalf("STALL 快照应带阶段名与模型名，实际: %q", output)
 	}
 }
 
-// TestRequestStallWatchdogSilentAfterKeepaliveActive 验证保活生效后看门狗不再误报，
-// 否则长流（几十秒的正常流式输出）会被当成卡顿刷日志。
-func TestRequestStallWatchdogSilentAfterKeepaliveActive(t *testing.T) {
+// TestRequestStallWatchdogSilentAfterOutput 验证下游一旦有字节（抢先假思考首帧或心跳）
+// 看门狗就收工，否则长流会被当成卡顿刷日志。
+func TestRequestStallWatchdogSilentAfterOutput(t *testing.T) {
 	withStallWatchpoints(t, 10*time.Millisecond)
 	readLog := captureLog(t)
 
 	tracker := newRequestPhaseTracker()
+	tracker.setStream(true)
+	tracker.markOutput()
 	tracker.set(phaseWaitingUpstream)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -109,7 +123,25 @@ func TestRequestStallWatchdogSilentAfterKeepaliveActive(t *testing.T) {
 
 	time.Sleep(150 * time.Millisecond)
 	if output := readLog(); strings.Contains(output, "[STALL]") {
-		t.Fatalf("保活生效后不应打 STALL: %q", output)
+		t.Fatalf("已有下游字节后不应打 STALL: %q", output)
+	}
+}
+
+// TestRequestStallWatchdogSilentForNonStream 验证非流式请求不参与布防：
+// 它本来就要等完整响应，长时间没有字节是正常的。
+func TestRequestStallWatchdogSilentForNonStream(t *testing.T) {
+	withStallWatchpoints(t, 10*time.Millisecond)
+	readLog := captureLog(t)
+
+	tracker := newRequestPhaseTracker()
+	tracker.setStream(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watchRequestStall(ctx, "/v1/chat/completions", tracker, time.Now())
+
+	time.Sleep(150 * time.Millisecond)
+	if output := readLog(); strings.Contains(output, "[STALL]") {
+		t.Fatalf("非流式请求不应打 STALL: %q", output)
 	}
 }
 
@@ -119,6 +151,7 @@ func TestRequestStallWatchdogStopsOnContextCancel(t *testing.T) {
 	readLog := captureLog(t)
 
 	tracker := newRequestPhaseTracker()
+	tracker.setStream(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	watchRequestStall(ctx, "/v1/chat/completions", tracker, time.Now())
 	cancel()
