@@ -6831,7 +6831,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolChat)
 	defer stopRetryDeadline()
-	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, isStream, "text/event-stream")
+	// 伪装思考（CPA 抢先思考 + 按序 Keepalive 假思考的迁移）：总开关打开且为
+	// 流式时，把保活载荷换成可配置的假思考帧——首帧在开流时立即发出，之后每次
+	// 心跳按序附加一条文案；首个上游真实内容到达后自动退回纯注释心跳。
+	fakeThinking := newFakeThinkingStateForChat(responseModel)
+	stopRetryKeepalive := installStreamFakeThinkingKeepalive(c, isStream, fakeThinking)
 	defer stopRetryKeepalive()
 	activateContinuousRetryKeepalive(c.Request.Context())
 
@@ -7384,6 +7388,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				if contentTokenSeen {
 					preContentErrorCandidate = nil
+					// 真实内容已到达：停止注入假思考帧，后续心跳退回纯注释。
+					fakeThinking.markFirstContentSeen()
 				}
 				// 累计 delta 字符数（文本 + function call 参数）
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {

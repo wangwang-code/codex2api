@@ -29,6 +29,7 @@ func ConfigureDownstreamKeepaliveFromEnv() {
 	downstreamSSEKeepaliveInterval = downstreamSSEKeepaliveIntervalFromEnv()
 	continuousRetryKeepaliveInterval = downstreamSSEKeepaliveInterval
 	downstreamWSKeepaliveInterval = downstreamWSKeepaliveIntervalFromEnv()
+	ConfigureStreamFakeThinkingFromEnv()
 }
 
 // startDownstreamSSEKeepalive 周期执行 writeKeepalive，直到请求取消、写失败

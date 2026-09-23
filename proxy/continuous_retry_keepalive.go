@@ -34,6 +34,9 @@ type requestContinuousRetryKeepalive struct {
 	last     time.Time
 	write    func() error
 	cancel   context.CancelCauseFunc
+	// primeImmediately 让首个心跳在第一次等待循环里立即落地（抢先开流），
+	// 而不是等满一个保活周期。仅在伪装思考的抢先模式下置位。
+	primeImmediately bool
 }
 
 // Activate 开始请求级保活时间窗；重复激活不会重置已有时间窗。
@@ -51,6 +54,11 @@ func (k *requestContinuousRetryKeepalive) Activate() {
 		// 从请求具备下游保活资格时开始计时；后续短等待共用同一时间窗，
 		// 不在每次重试时重新开始一个完整周期。
 		k.last = time.Now()
+		if k.primeImmediately && continuousRetryKeepaliveInterval > 0 {
+			// 抢先模式：把时间窗起点前移一个周期，使下一次 delay 计算为 0，
+			// 首个心跳随即在等待循环的第一次迭代写出（提交 SSE 200 并发首帧）。
+			k.last = k.last.Add(-continuousRetryKeepaliveInterval)
+		}
 	}
 }
 
@@ -128,6 +136,11 @@ func installContinuousRetryMessagesKeepalive(c *gin.Context, stream bool) func()
 type continuousRetrySSEKeepaliveOptions struct {
 	contentType string
 	payload     string
+	// payloadFunc 非空时逐次生成心跳载荷，用于按序发送伪装思考帧。
+	// 返回空串表示本次沿用 payload。
+	payloadFunc func() string
+	// primeFirstBeat 让首个心跳在第一次等待循环里立即落地（抢先开流）。
+	primeFirstBeat bool
 }
 
 // installContinuousRetrySSEKeepaliveWithOptions 安装带指定内容类型和心跳载荷的请求保活。
@@ -153,14 +166,20 @@ func installContinuousRetrySSEKeepaliveWithOptions(c *gin.Context, stream bool, 
 	}
 	original := c.Request
 	requestCtx, cancel := context.WithCancelCause(original.Context())
-	keepalive := &requestContinuousRetryKeepalive{ctx: requestCtx, write: func() error {
+	keepalive := &requestContinuousRetryKeepalive{ctx: requestCtx, primeImmediately: options.primeFirstBeat, write: func() error {
 		setSSEStreamHeaders(c, options.contentType)
 		if !c.Writer.Written() {
 			// Cloudflare 对 102 之后的最终响应仍有 125s 限制；长期保活
 			// 必须建立 SSE 200，再持续写入协议内心跳帧。
 			c.Writer.WriteHeaderNow()
 		}
-		if _, err := io.WriteString(responseWriter, options.payload); err != nil {
+		body := options.payload
+		if options.payloadFunc != nil {
+			if next := options.payloadFunc(); next != "" {
+				body = next
+			}
+		}
+		if _, err := io.WriteString(responseWriter, body); err != nil {
 			return err
 		}
 		if flusher, ok := responseWriter.(http.Flusher); ok {

@@ -1,0 +1,68 @@
+name: Build linux/amd64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'magic*'
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-linux-amd64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_APP_VERSION: ${{ github.sha }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Vet proxy package
+        run: go vet ./proxy/
+
+      - name: Build linux/amd64 ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="${GITHUB_SHA::7}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X github.com/codex2api/internal/version.Version=${version}" \
+            -o dist/codex2api-linux-amd64 .
+          file dist/codex2api-linux-amd64
+          sha256sum dist/codex2api-linux-amd64 | tee dist/SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex2api-linux-amd64
+          path: |
+            dist/codex2api-linux-amd64
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
