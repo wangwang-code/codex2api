@@ -37,6 +37,26 @@ type requestContinuousRetryKeepalive struct {
 	// primeImmediately 让首个心跳在第一次等待循环里立即落地（抢先开流），
 	// 而不是等满一个保活周期。仅在伪装思考的抢先模式下置位。
 	primeImmediately bool
+	// interval 覆盖本次请求的心跳节奏（可为 nil）。伪装思考用它把「等上游首个内容」
+	// 空窗里的心跳调密——CPA 的 streaming.keepalive-seconds 就是这个节奏，线上用 1s，
+	// 而全局保活默认 30s，两者相差 30 倍，按序文案在 30s 节奏下根本来不及发出。
+	// 返回 <= 0 表示沿用全局保活间隔。
+	interval func() time.Duration
+}
+
+// currentInterval 返回本次心跳应使用的间隔：优先用请求级覆盖，否则用全局保活间隔。
+// 全局保活被关闭（<= 0）时一律返回 0——假思考是心跳的载荷，保活关闭时它没有载体。
+// 调用方可能已持有 k.mu，本方法自身不加锁。
+func (k *requestContinuousRetryKeepalive) currentInterval() time.Duration {
+	if continuousRetryKeepaliveInterval <= 0 {
+		return 0
+	}
+	if k != nil && k.interval != nil {
+		if override := k.interval(); override > 0 {
+			return override
+		}
+	}
+	return continuousRetryKeepaliveInterval
 }
 
 // Activate 开始请求级保活时间窗；重复激活不会重置已有时间窗。
@@ -54,10 +74,10 @@ func (k *requestContinuousRetryKeepalive) Activate() {
 		// 从请求具备下游保活资格时开始计时；后续短等待共用同一时间窗，
 		// 不在每次重试时重新开始一个完整周期。
 		k.last = time.Now()
-		if k.primeImmediately && continuousRetryKeepaliveInterval > 0 {
+		if interval := k.currentInterval(); k.primeImmediately && interval > 0 {
 			// 抢先模式：把时间窗起点前移一个周期，使下一次 delay 计算为 0，
 			// 首个心跳随即在等待循环的第一次迭代写出（提交 SSE 200 并发首帧）。
-			k.last = k.last.Add(-continuousRetryKeepaliveInterval)
+			k.last = k.last.Add(-interval)
 		}
 	}
 }
@@ -101,10 +121,11 @@ func (k *requestContinuousRetryKeepalive) Keepalive() error {
 	if !k.activeLocked() || k.write == nil {
 		return nil
 	}
-	if continuousRetryKeepaliveInterval <= 0 {
+	interval := k.currentInterval()
+	if interval <= 0 {
 		return nil
 	}
-	if !k.last.IsZero() && time.Since(k.last) < continuousRetryKeepaliveInterval {
+	if !k.last.IsZero() && time.Since(k.last) < interval {
 		return nil
 	}
 	if err := k.write(); err != nil {
@@ -144,6 +165,10 @@ type continuousRetrySSEKeepaliveOptions struct {
 	// onWrite 在每次成功写出心跳后调用。请求卡顿看门狗用它判定「下游已经有字节」，
 	// 从而只在真正零字节的窗口内布防。
 	onWrite func()
+	// intervalFunc 非空时逐次给出本次心跳的期望间隔，用于让伪装思考在「等上游首个内容」
+	// 空窗里按更密的节奏推进（对齐 CPA 的 streaming.keepalive-seconds）。
+	// 返回 <= 0 表示沿用全局保活间隔。
+	intervalFunc func() time.Duration
 }
 
 // installContinuousRetrySSEKeepaliveWithOptions 安装带指定内容类型和心跳载荷的请求保活。
@@ -169,7 +194,7 @@ func installContinuousRetrySSEKeepaliveWithOptions(c *gin.Context, stream bool, 
 	}
 	original := c.Request
 	requestCtx, cancel := context.WithCancelCause(original.Context())
-	keepalive := &requestContinuousRetryKeepalive{ctx: requestCtx, primeImmediately: options.primeFirstBeat, write: func() error {
+	keepalive := &requestContinuousRetryKeepalive{ctx: requestCtx, primeImmediately: options.primeFirstBeat, interval: options.intervalFunc, write: func() error {
 		setSSEStreamHeaders(c, options.contentType)
 		if !c.Writer.Written() {
 			// Cloudflare 对 102 之后的最终响应仍有 125s 限制；长期保活
@@ -302,19 +327,23 @@ func continuousRetryKeepaliveActive(ctx context.Context) bool {
 
 // continuousRetryKeepaliveDelay 计算距离下一次请求级心跳的剩余等待时间。
 func continuousRetryKeepaliveDelay(keepalive continuousRetryKeepalive) time.Duration {
-	if continuousRetryKeepaliveInterval <= 0 {
-		return 0
-	}
 	requestKeepalive, ok := keepalive.(*requestContinuousRetryKeepalive)
 	if !ok {
+		if continuousRetryKeepaliveInterval <= 0 {
+			return 0
+		}
 		return continuousRetryKeepaliveInterval
 	}
 	requestKeepalive.mu.Lock()
 	defer requestKeepalive.mu.Unlock()
-	if !requestKeepalive.activeLocked() || requestKeepalive.last.IsZero() {
-		return continuousRetryKeepaliveInterval
+	interval := requestKeepalive.currentInterval()
+	if interval <= 0 {
+		return 0
 	}
-	delay := continuousRetryKeepaliveInterval - time.Since(requestKeepalive.last)
+	if !requestKeepalive.activeLocked() || requestKeepalive.last.IsZero() {
+		return interval
+	}
+	delay := interval - time.Since(requestKeepalive.last)
 	if delay < 0 {
 		return 0
 	}

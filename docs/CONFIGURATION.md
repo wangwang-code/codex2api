@@ -103,12 +103,13 @@ Codex2API 采用三层配置架构：
 | `CODEX_STATSIG_API_KEY` | 否 | 内置公开 key | 覆盖 Codex Desktop/CLI 共用的公开 Statsig SDK key，仅遥测开启时使用 |
 | `CODEX_SESSION_HEADER_MODE` | 否 | `native` | 出站会话头形态。`native` 发真实客户端的 `session-id` / `thread-id` / `x-client-request-id`；`legacy` 回退到旧的 `Session_id`（WS 另带 `Conversation_id`） |
 | `CODEX_SESSION_HEADER_ALIGN_CONVERGED` | 否 | `false` | 开启后 `session-id` 头改用指纹收敛后的会话身份，与 turn metadata 的 `session_id` 对齐。默认关：请求体 `prompt_cache_key` 始终独立隔离，但上游是否也拿该头参与缓存分组无法从客户端源码确认 |
-| `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` | 否 | `30s` | 下游 HTTP/SSE 保活周期，使用 Go duration；`0` 关闭。流式端点从首个心跳起建立 SSE 200，发送注释或 Messages ping；非流式端点发送 HTTP 102 |
+| `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` | 否 | `30s` | 下游 HTTP/SSE 保活周期，使用 Go duration；`0` 关闭。流式端点从首个心跳起建立 SSE 200，发送注释或 Messages ping；非流式端点发送 HTTP 102。伪装思考在空窗里用独立的 `STREAM_FAKE_THINKING_INTERVAL`（默认 `1s`），上游开始产出后回落本项 |
 | `DOWNSTREAM_WS_KEEPALIVE_INTERVAL` | 否 | `45s` | 下游 WebSocket Ping 周期，使用 Go duration；`0` 关闭。覆盖 Responses、Realtime 与 Live Sideband |
 | `DISPATCH_ACCOUNT_WAIT_TIMEOUT` | 否 | `30s` | 调度队列等待上限，使用 Go duration。索引调度/影子校验在没有可立刻派发的账号时会排队等容量，最长等这么久；`0` 表示不排队、立刻返回 503（与 CPA 一致）。旧版扫描不排队。只影响等待上限，不改变账号选择顺序 |
 | `STREAM_FAKE_THINKING_ENABLED` | 否 | `false` | 伪装思考总开关。打开后仅对 `/v1/chat/completions` 流式响应生效，在等待上游首个内容 token 期间把保活载荷换成只带 `delta.reasoning_content` 的 `chat.completion.chunk` 假帧 |
 | `STREAM_FAKE_THINKING_IMMEDIATE` | 否 | `true` | 首个心跳是否立即落地（抢先开流）。开启时请求一进入等待上游阶段就提交 SSE 200 并发出开流首帧；关闭时等满一个保活周期 |
 | `STREAM_FAKE_THINKING_TEXT` | 否 | 内置英文文案 | 开流首帧的假思考文案。留空回落到内置英文文案，中文业务应显式设置。支持 `\n` `\r` `\t` `\\` `\"` 转义 |
+| `STREAM_FAKE_THINKING_INTERVAL` | 否 | `1s` | 假思考在「等上游首个内容」空窗里的心跳节奏（Go duration）。对齐 CPA 的 `streaming.keepalive-seconds`（线上用 `1s`）；`0` = 跟随 `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL`。上游开始产出后自动回落全局保活间隔 |
 | `STREAM_FAKE_THINKING_TEXTS` | 否 | 空 | 每次 Keepalive 按序附加的假思考文案，`\|` 分隔或 JSON 数组。空项=该次只发心跳但下标继续推进，列表耗尽后恢复纯心跳。`\|` 写法逐项还原转义，文案开头的 `\n` 会保留。**必须写成单行**——`.env` 不支持跨行值，跨行会让整个文件解析失败（服务拒绝启动并报错） |
 | `UPSTREAM_ERROR_REWRITE_ENABLED` | 否 | `false` | 上游错误消息改写总开关。打开后按客户端实际收到的 HTTP 状态码替换错误 `message`，并停止透传上游原始 error body 与上游身份 |
 | `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` | 否 | 空 | 未在下面列出的状态码使用的默认文案；留空表示这些状态码原样透出 |
@@ -346,7 +347,9 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 
 文案的转义语义与 CPA 的 YAML 双引号对齐：`.env` 本身不做转义，因此 `STREAM_FAKE_THINKING_TEXT` 与 `STREAM_FAKE_THINKING_TEXTS` 的 `|` 写法都会由网关还原 `\n` `\r` `\t` `\\` `\"`，让线上 YAML 配置可以逐字平移；`STREAM_FAKE_THINKING_TEXTS` 的 JSON 数组写法则交给 JSON 解码器。文案开头的换行符会原样写入 `reasoning_content`（不会被裁剪），只做「纯空白即视为空项」的判断。首帧文案留空时回落到内置英文文案，与 CPA `buildEarlyThinkingChunk` 的兜底一致，中文业务应显式设置 `STREAM_FAKE_THINKING_TEXT`。
 
-**停止时机**：按序文案只在上游产出**答案正文**（`response.output_text.*`、工具调用参数）后停止注入。上游的 reasoning 事件（`response.reasoning_summary_text.delta` 等）**不算**——它们同样带 `delta` 字段，但此时下游还没拿到译文，若据此停止，后续心跳会全部退回纯注释，`STREAM_FAKE_THINKING_TEXTS` 里的文案永远轮不到（线上表现为「SSE 里只有首帧文案」）。这与断流重试用的 `contentTokenSeen` 刻意分开：后者含 reasoning 是正确的（上游一旦开始输出就不该换号重放，否则重复计费），但假思考的停止时机必须更严。
+**停止时机（与 CPA 一致）**：上游首个内容事件一到就停止注入，此后心跳退回纯注释——假思考只覆盖「等上游首个内容」的空窗，上游一旦开始产出（含 reasoning，因为它同样是上游已开始产出）就没有空窗可填了。
+
+**推进节奏**：按序文案每次心跳只推进一条，节奏由 `STREAM_FAKE_THINKING_INTERVAL` 决定，默认 `1s`——对齐 CPA 的 `streaming.keepalive-seconds`（线上用的就是 `1s`，示例配置 `15s`）。于是**能发出几条 = 空窗时长 ÷ 节奏**（空项也占一个心跳）。空窗通常只有几秒，如果把节奏绑在全局保活间隔上（默认 `30s`），空窗内连第二次心跳都等不到，客户端只会看到开流首帧——这是「配了多条文案却从未被挑选」最常见的原因。上游开始产出后 `intervalOverride` 返回 0，自动回落全局保活间隔，所以不会让整条流一直按 `1s` 发心跳。设为 `0` 可显式跟随 `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL`。启动日志会打印实际节奏与「空窗内最多发出几条」的关系，节奏大于 `5s` 时额外提示。
 
 **`.env` 写法约束**：`STREAM_FAKE_THINKING_TEXTS` 必须写成单行。`.env` 不支持跨行值，跨行（值后面直接换行、后续行接着写文案）会让 `godotenv` 解析失败，而解析失败时**该文件内所有配置都不生效**（包括出错行之前的）。服务在启动时会拒绝启动并打印具体行号与原因；配置生效时也会打印解析结果（`STREAM_FAKE_THINKING_TEXTS 解析出 N 条`），列表为空会明确告警，不必靠猜。
 

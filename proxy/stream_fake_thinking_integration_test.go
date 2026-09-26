@@ -54,10 +54,15 @@ func reasoningValuesFromSSE(t *testing.T, body string) []string {
 func TestChatCompletionsPreemptiveFakeThinkingReachesDownstream(t *testing.T) {
 	previousInterval := continuousRetryKeepaliveInterval
 	continuousRetryKeepaliveInterval = 20 * time.Millisecond
+	// 假思考有自己的空窗节奏（STREAM_FAKE_THINKING_INTERVAL，默认 1s），不再跟随全局
+	// 保活间隔；本用例靠密集心跳在 250ms 空窗里把三条文案发完，所以两者都要调小。
+	previousRhythm := streamFakeThinkingInterval
+	streamFakeThinkingInterval = 20 * time.Millisecond
 	previousEnabled, previousImmediate := streamFakeThinkingEnabled, streamFakeThinkingImmediate
 	previousText, previousTexts := streamFakeThinkingText, streamFakeThinkingTexts
 	t.Cleanup(func() {
 		continuousRetryKeepaliveInterval = previousInterval
+		streamFakeThinkingInterval = previousRhythm
 		streamFakeThinkingEnabled, streamFakeThinkingImmediate = previousEnabled, previousImmediate
 		streamFakeThinkingText, streamFakeThinkingTexts = previousText, previousTexts
 	})

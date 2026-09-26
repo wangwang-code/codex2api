@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	"github.com/tidwall/gjson"
 )
 
 // TestStreamFakeThinkingEnabledFromEnv 验证总开关的默认值与识别规则。
@@ -402,78 +401,82 @@ func TestStreamFakeThinkingTextsSurviveDotenvParsing(t *testing.T) {
 	}
 }
 
-// TestFakeThinkingContentArrivedIgnoresReasoning 验证上游 reasoning 事件不停止假思考。
-//
-// 这是线上现象的回归：上游是 codex 模型，先流式输出 reasoning（思考摘要）再输出译文。
-// reasoning 事件同样带 delta 字段，所以 isFirstTokenResult 会把它判成「已出内容」——
-// 一旦拿它当停止条件，后续心跳全部退回纯注释，STREAM_FAKE_THINKING_TEXTS 里的按序
-// 文案永远轮不到（实测现象：SSE 里只有首帧文案）。
-func TestFakeThinkingContentArrivedIgnoresReasoning(t *testing.T) {
-	for _, raw := range []string{
-		`{"type":"response.reasoning_summary_text.delta","delta":"让我先理清需求"}`,
-		`{"type":"response.reasoning_text.delta","delta":"thinking"}`,
-	} {
-		parsed := gjson.Parse(raw)
-		eventType := parsed.Get("type").String()
-		if fakeThinkingContentArrived(eventType, parsed) {
-			t.Fatalf("%s 不应被视为答案内容，否则假思考会提前停掉", eventType)
+// TestStreamFakeThinkingIntervalFromEnv 验证假思考节奏的默认值与识别规则。
+// 默认 1s：与 CPA 的 streaming.keepalive-seconds 对齐（线上用 1s）。
+func TestStreamFakeThinkingIntervalFromEnv(t *testing.T) {
+	t.Run("default-one-second", func(t *testing.T) {
+		t.Setenv("STREAM_FAKE_THINKING_INTERVAL", "")
+		if got := streamFakeThinkingIntervalFromEnv(); got != time.Second {
+			t.Fatalf("interval = %s, want 1s", got)
 		}
-		// 对照：通用的严格首字判定确实把它算作内容。这说明两个判据不能共用——
-		// contentTokenSeen 含 reasoning 是对的（上游一旦开始输出就不该换号重放），
-		// 但假思考的停止时机必须更严。
-		if !isFirstTokenResult(parsed) {
-			t.Fatalf("%s 本应被 isFirstTokenResult 判为内容，用例前提不成立", eventType)
+	})
+	t.Run("explicit-values", func(t *testing.T) {
+		for _, tc := range []struct {
+			raw  string
+			want time.Duration
+		}{
+			{raw: "0", want: 0},
+			{raw: "3s", want: 3 * time.Second},
+			{raw: "500ms", want: 500 * time.Millisecond},
+			{raw: "非法值", want: time.Second},
+		} {
+			t.Setenv("STREAM_FAKE_THINKING_INTERVAL", tc.raw)
+			if got := streamFakeThinkingIntervalFromEnv(); got != tc.want {
+				t.Fatalf("interval(%q) = %s, want %s", tc.raw, got, tc.want)
+			}
 		}
-	}
+	})
 }
 
-// TestFakeThinkingContentArrivedOnAnswerText 验证真正的答案正文会停止假思考。
-func TestFakeThinkingContentArrivedOnAnswerText(t *testing.T) {
-	for _, raw := range []string{
-		`{"type":"response.output_text.delta","delta":"译文开头"}`,
-		`{"type":"response.output_text.done","text":"译文"}`,
-		`{"type":"response.function_call_arguments.delta","delta":"{\"a\""}`,
-	} {
-		parsed := gjson.Parse(raw)
-		if !fakeThinkingContentArrived(parsed.Get("type").String(), parsed) {
-			t.Fatalf("%s 应当被视为答案内容", parsed.Get("type").String())
-		}
-	}
-}
-
-// TestFakeThinkingKeepsSequencingAfterReasoning 验证「先来 reasoning、后有心跳」时
-// 按序文案照常推进——也就是修复后的完整行为，而不只是单个判据。
-func TestFakeThinkingKeepsSequencingAfterReasoning(t *testing.T) {
+// TestFakeThinkingIntervalOverride 验证节奏覆盖只在「等上游首个内容」的空窗里生效：
+// 上游一旦开始产出（firstContentSeen）就回落全局保活间隔，非 chat 协议不参与。
+func TestFakeThinkingIntervalOverride(t *testing.T) {
 	state := &fakeThinkingState{
 		protocol:  fakeThinkingProtocolChat,
-		model:     "gpt-5.6-codex",
-		firstText: "开流首帧",
-		texts:     productionFakeThinkingTexts,
+		firstText: "首帧",
+		texts:     []string{"第二条"},
+		interval:  2 * time.Second,
+	}
+	if got := state.intervalOverride(); got != 2*time.Second {
+		t.Fatalf("注入阶段的节奏 = %s, want 2s", got)
 	}
 
-	// 首帧（抢先开流）。
-	if got := reasoningOf(t, state.payload()); got != "开流首帧" {
-		t.Fatalf("preemptive reasoning = %q", got)
-	}
-
-	// 上游开始输出 reasoning：不得停止假思考。
-	reasoning := gjson.Parse(`{"type":"response.reasoning_summary_text.delta","delta":"上游在思考"}`)
-	if fakeThinkingContentArrived(reasoning.Get("type").String(), reasoning) {
-		t.Fatal("reasoning 不应停止假思考")
-	}
-
-	// 心跳继续：按序文案照常发出（修复前这里只会是纯注释）。
-	if got := reasoningOf(t, state.payload()); got != "\n云翻译处于灰测中" {
-		t.Fatalf("reasoning 之后的首个心跳 = %q，按序文案被吞掉了", got)
-	}
-
-	// 译文到达后才停。
-	answer := gjson.Parse(`{"type":"response.output_text.delta","delta":"译文"}`)
-	if !fakeThinkingContentArrived(answer.Get("type").String(), answer) {
-		t.Fatal("答案正文应当停止假思考")
-	}
 	state.markFirstContentSeen()
-	if got := state.payload(); got != continuousRetryKeepaliveComment {
-		t.Fatalf("答案到达后心跳应为纯注释，got %q", got)
+	if got := state.intervalOverride(); got != 0 {
+		t.Fatalf("上游开始产出后应回落全局保活间隔（0 表示跟随），got %s", got)
+	}
+
+	other := &fakeThinkingState{protocol: "responses", interval: 2 * time.Second}
+	if got := other.intervalOverride(); got != 0 {
+		t.Fatalf("非 chat 协议不应覆盖节奏, got %s", got)
+	}
+	if got := (*fakeThinkingState)(nil).intervalOverride(); got != 0 {
+		t.Fatalf("nil 状态不应覆盖节奏, got %s", got)
+	}
+}
+
+// TestRequestKeepaliveIntervalOverride 验证请求级节奏覆盖与「全局保活关闭」的优先级：
+// 覆盖值优先于全局间隔，但全局保活关闭（<= 0）时一律不发心跳（假思考没有载体）。
+func TestRequestKeepaliveIntervalOverride(t *testing.T) {
+	restore := continuousRetryKeepaliveInterval
+	defer func() { continuousRetryKeepaliveInterval = restore }()
+
+	continuousRetryKeepaliveInterval = 30 * time.Second
+	overridden := &requestContinuousRetryKeepalive{interval: func() time.Duration { return time.Second }}
+	if got := overridden.currentInterval(); got != time.Second {
+		t.Fatalf("覆盖后的间隔 = %s, want 1s", got)
+	}
+	plain := &requestContinuousRetryKeepalive{}
+	if got := plain.currentInterval(); got != 30*time.Second {
+		t.Fatalf("未覆盖时应用全局间隔, got %s", got)
+	}
+	zeroOverride := &requestContinuousRetryKeepalive{interval: func() time.Duration { return 0 }}
+	if got := zeroOverride.currentInterval(); got != 30*time.Second {
+		t.Fatalf("覆盖值为 0 时应沿用全局间隔, got %s", got)
+	}
+
+	continuousRetryKeepaliveInterval = 0
+	if got := overridden.currentInterval(); got != 0 {
+		t.Fatalf("全局保活关闭时不应发心跳（含假思考）, got %s", got)
 	}
 }

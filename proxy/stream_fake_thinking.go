@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 )
 
 // 本文件把 CPA 补丁（cliproxy-thinking-mask 的 _cpa-overlay）里的
@@ -36,6 +35,12 @@ const (
 
 	// fakeThinkingProtocolChat 是当前唯一支持注入假思考帧的下游协议。
 	fakeThinkingProtocolChat = "chat"
+
+	// defaultStreamFakeThinkingInterval 是假思考在「等上游首个内容」空窗里的心跳节奏。
+	// 与 CPA 的 streaming.keepalive-seconds 对齐：CPA 线上用的是 1s，示例配置 15s。
+	// 全局保活间隔（DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL）默认 30s，按那个节奏走的话
+	// 空窗内连第二次心跳都等不到，按序文案只会停在开流首帧。
+	defaultStreamFakeThinkingInterval = time.Second
 )
 
 // 配置变量形式与 downstreamSSEKeepaliveInterval 一致：包初始化时读取进程环境变量，
@@ -45,7 +50,14 @@ var (
 	streamFakeThinkingImmediate = streamFakeThinkingImmediateFromEnv()
 	streamFakeThinkingText      = streamFakeThinkingTextFromEnv()
 	streamFakeThinkingTexts     = streamFakeThinkingTextsFromEnv()
+	streamFakeThinkingInterval  = streamFakeThinkingIntervalFromEnv()
 )
+
+// streamFakeThinkingIntervalFromEnv 读取假思考在空窗里的心跳节奏。
+// 默认 1s（对齐 CPA 线上）；0 表示跟随全局保活间隔。
+func streamFakeThinkingIntervalFromEnv() time.Duration {
+	return durationFromEnv("STREAM_FAKE_THINKING_INTERVAL", defaultStreamFakeThinkingInterval)
+}
 
 // streamFakeThinkingEnabledFromEnv 读取伪装思考总开关，默认关闭。
 // 关闭时本文件所有逻辑都不生效，下游保活行为与改动前完全一致。
@@ -116,6 +128,7 @@ func ConfigureStreamFakeThinkingFromEnv() {
 	streamFakeThinkingImmediate = streamFakeThinkingImmediateFromEnv()
 	streamFakeThinkingText = streamFakeThinkingTextFromEnv()
 	streamFakeThinkingTexts = streamFakeThinkingTextsFromEnv()
+	streamFakeThinkingInterval = streamFakeThinkingIntervalFromEnv()
 	logStreamFakeThinkingConfig()
 }
 
@@ -148,6 +161,22 @@ func logStreamFakeThinkingConfig() {
 		parts = append(parts, fmt.Sprintf("[%d]%q", i, text))
 	}
 	log.Printf("[Config] STREAM_FAKE_THINKING_TEXTS 解析出 %d 条：%s", len(streamFakeThinkingTexts), strings.Join(parts, " "))
+	// 按序文案每次心跳只推进一条，而上游首个内容事件一到假思考就停止，所以能发出几条
+	// 取决于「等上游首个内容」的空窗里塞得下几个心跳。空窗通常只有几秒，节奏偏慢时
+	// 客户端只会看到开流首帧——这是配置看起来「没生效」的最常见原因。
+	if continuousRetryKeepaliveInterval <= 0 {
+		log.Printf("[Config] 注意：DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL=0 已关闭下游保活，伪装思考没有心跳载体，不会下发假思考帧")
+		return
+	}
+	rhythm, source := streamFakeThinkingInterval, "STREAM_FAKE_THINKING_INTERVAL"
+	if rhythm <= 0 {
+		rhythm, source = continuousRetryKeepaliveInterval, "跟随 DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL"
+	}
+	log.Printf("[Config] 按序文案节奏=%s（%s），上游首个内容到达即停止注入，空窗内最多发出「空窗时长 ÷ 节奏」条", rhythm, source)
+	if rhythm > 5*time.Second {
+		log.Printf("[Config] 注意：节奏 %s 偏慢，而空窗通常只有几秒，很可能只发得出开流首帧。"+
+			"CPA 侧对应项 streaming.keepalive-seconds 线上用 1s，需要文案尽快出现请调小 STREAM_FAKE_THINKING_INTERVAL", rhythm)
+	}
 }
 
 // boolFromEnv 与 decodeEnvEscapes 见 env_config.go（与上游错误改写共用同一套语义）。
@@ -165,6 +194,9 @@ type fakeThinkingState struct {
 	preempted        bool
 	firstContentSeen bool
 	primeImmediately bool
+	// interval 是假思考期望的心跳节奏，只在「等上游首个内容」的空窗里生效；
+	// 上游一旦开始产出（firstContentSeen）就回落全局保活间隔。0 表示跟随全局。
+	interval time.Duration
 }
 
 // newFakeThinkingStateForChat 在总开关打开时为 chat 协议构造共享状态，否则返回 nil。
@@ -184,7 +216,22 @@ func newFakeThinkingStateForChat(responseModel string) *fakeThinkingState {
 		firstText:        firstText,
 		texts:            streamFakeThinkingTexts,
 		primeImmediately: streamFakeThinkingImmediate,
+		interval:         streamFakeThinkingInterval,
 	}
+}
+
+// intervalOverride 返回假思考期望的心跳间隔；不在注入阶段（非 chat 协议或上游已开始
+// 产出）时返回 0，表示沿用全局保活间隔——所以只有「等上游首个内容」的空窗会被调密。
+func (s *fakeThinkingState) intervalOverride() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.protocol != fakeThinkingProtocolChat || s.firstContentSeen {
+		return 0
+	}
+	return s.interval
 }
 
 // markFirstContentSeen 标记上游首个真实内容已到达，此后不再注入假思考帧。
@@ -195,35 +242,6 @@ func (s *fakeThinkingState) markFirstContentSeen() {
 	s.mu.Lock()
 	s.firstContentSeen = true
 	s.mu.Unlock()
-}
-
-// isReasoningOnlyEventType 报告事件是否只承载上游思考（reasoning）内容。
-//
-// 这些事件也有 delta 字段，因此 isFirstTokenResult 会判为「已出内容」；但对下游客户端
-// 而言它们不是答案正文（云翻译前端通常只渲染 content），此时停掉假思考会让后续心跳
-// 退回纯注释，STREAM_FAKE_THINKING_TEXTS 永远轮不到。
-func isReasoningOnlyEventType(eventType string) bool {
-	switch eventType {
-	case "response.reasoning_summary_text.delta",
-		"response.reasoning_summary_text.done",
-		"response.reasoning_text.delta",
-		"response.reasoning_text.done",
-		"response.reasoning_summary_part.added",
-		"response.reasoning_summary_part.done":
-		return true
-	}
-	return false
-}
-
-// fakeThinkingContentArrived 报告「上游已产出可见答案」，此时才停止注入假思考帧。
-//
-// 与 contentTokenSeen 的分工：后者是断流重试的判定（严格但含 reasoning——上游一旦开始
-// 输出就不该换号重放，否则重复计费），本函数只服务假思考的停止时机，刻意排除 reasoning。
-func fakeThinkingContentArrived(eventType string, parsed gjson.Result) bool {
-	if isReasoningOnlyEventType(eventType) {
-		return false
-	}
-	return isFirstTokenResult(parsed)
 }
 
 // shouldPrimeFirstBeat 报告首个心跳是否应当立即落地（抢先开流）。
@@ -326,6 +344,9 @@ func installStreamFakeThinkingKeepalive(c *gin.Context, stream bool, state *fake
 	if state != nil {
 		options.payloadFunc = state.payload
 		options.primeFirstBeat = state.shouldPrimeFirstBeat()
+		// 空窗内按假思考自己的节奏推进（默认 1s，对齐 CPA 的 keepalive-seconds）；
+		// 上游开始产出后 intervalOverride 返回 0，自动回落全局保活间隔。
+		options.intervalFunc = state.intervalOverride
 	}
 	return installContinuousRetrySSEKeepaliveWithOptions(c, stream, options)
 }
