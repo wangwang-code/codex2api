@@ -448,3 +448,29 @@ func TestApplyTimezoneKeepsLocalOnInvalidTZ(t *testing.T) {
 		t.Fatalf("非法 TZ 不应改动 time.Local, got %q", time.Local)
 	}
 }
+
+// TestLoadRejectsMalformedDotenv 验证「.env 存在但解析失败」不会被静默忽略。
+//
+// godotenv 解析失败时返回的 map 会被整体丢弃，也就是该文件里**所有**配置都不生效，
+// 包括出错行之前的那些。旧实现用 `_ = godotenv.Load(...)` 把错误吞掉，服务会带着默认
+// 配置继续跑，而日志里没有任何提示——线上表现为「配了但不生效」，极难自查。
+//
+// 最常见的触发方式就是跨行书写：.env 不支持多行值，换行必须写成字面 \n。
+func TestLoadRejectsMalformedDotenv(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	content := "STREAM_FAKE_THINKING_TEXTS=\n" +
+		"云翻译处于灰测中||\n" +
+		"再耐心等等...|\n" +
+		"这有点超出预计耗时了\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("多行值的 .env 必须报错，不能静默失效")
+	}
+	if !strings.Contains(err.Error(), "跨行") {
+		t.Fatalf("错误信息应指出跨行书写这个原因，实际: %v", err)
+	}
+}

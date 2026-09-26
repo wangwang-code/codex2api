@@ -7382,6 +7382,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// treating loose TTFT as output would strand a retryable failure even
 		// though no downstream bytes were written.
 		contentTokenSeen := false
+		// 假思考的停止时机与 contentTokenSeen 分开：后者把上游 reasoning 也算作
+		// 「已出内容」（对重试安全是对的），但假思考要等真正的答案正文。
+		fakeThinkingContentSeen := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
 		var readErr error
@@ -7461,7 +7464,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				if contentTokenSeen {
 					preContentErrorCandidate = nil
-					// 真实内容已到达：停止注入假思考帧，后续心跳退回纯注释。
+				}
+				// 真实答案正文到达才停止注入假思考帧：上游先出 reasoning 时下游还没拿到
+				// 译文，此时停掉会让后续心跳退回纯注释，STREAM_FAKE_THINKING_TEXTS
+				// 永远轮不到（实测现象：SSE 里只有首帧文案）。
+				if !fakeThinkingContentSeen && fakeThinkingContentArrived(eventType, parsed) {
+					fakeThinkingContentSeen = true
 					fakeThinking.markFirstContentSeen()
 				}
 				// 累计 delta 字符数（文本 + function call 参数）

@@ -109,7 +109,7 @@ Codex2API 采用三层配置架构：
 | `STREAM_FAKE_THINKING_ENABLED` | 否 | `false` | 伪装思考总开关。打开后仅对 `/v1/chat/completions` 流式响应生效，在等待上游首个内容 token 期间把保活载荷换成只带 `delta.reasoning_content` 的 `chat.completion.chunk` 假帧 |
 | `STREAM_FAKE_THINKING_IMMEDIATE` | 否 | `true` | 首个心跳是否立即落地（抢先开流）。开启时请求一进入等待上游阶段就提交 SSE 200 并发出开流首帧；关闭时等满一个保活周期 |
 | `STREAM_FAKE_THINKING_TEXT` | 否 | 内置英文文案 | 开流首帧的假思考文案。留空回落到内置英文文案，中文业务应显式设置。支持 `\n` `\r` `\t` `\\` `\"` 转义 |
-| `STREAM_FAKE_THINKING_TEXTS` | 否 | 空 | 每次 Keepalive 按序附加的假思考文案，`\|` 分隔或 JSON 数组。空项=该次只发心跳但下标继续推进，列表耗尽后恢复纯心跳。`\|` 写法逐项还原转义，文案开头的 `\n` 会保留 |
+| `STREAM_FAKE_THINKING_TEXTS` | 否 | 空 | 每次 Keepalive 按序附加的假思考文案，`\|` 分隔或 JSON 数组。空项=该次只发心跳但下标继续推进，列表耗尽后恢复纯心跳。`\|` 写法逐项还原转义，文案开头的 `\n` 会保留。**必须写成单行**——`.env` 不支持跨行值，跨行会让整个文件解析失败（服务拒绝启动并报错） |
 | `UPSTREAM_ERROR_REWRITE_ENABLED` | 否 | `false` | 上游错误消息改写总开关。打开后按客户端实际收到的 HTTP 状态码替换错误 `message`，并停止透传上游原始 error body 与上游身份 |
 | `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` | 否 | 空 | 未在下面列出的状态码使用的默认文案；留空表示这些状态码原样透出 |
 | `UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` | 否 | 空 | 状态码到文案的映射。`\|` 分隔的 `状态码=文案`，或 JSON 对象；`\|` 写法逐项还原转义 |
@@ -345,6 +345,10 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 伪装思考（`STREAM_FAKE_THINKING_*`，迁移自 CPA 抢先思考补丁）在总开关打开后只改 `/v1/chat/completions` 的保活载荷：`STREAM_FAKE_THINKING_IMMEDIATE` 为真时，请求一进入等待上游的阶段就提交 SSE 200 并发出开流首帧（只带 `delta.reasoning_content`、不带 `delta.content` 的 `chat.completion.chunk`），随后每次心跳在标准 `: keepalive` 注释后按 `STREAM_FAKE_THINKING_TEXTS` 的顺序附加一条假思考帧，空项只发心跳但下标继续推进，列表耗尽后恢复纯心跳。上游首个真实内容 token 一到即停止注入。Responses、Messages、Gemini 等其它协议不下发本协议的帧，仍使用原有注释/ping 心跳。与 CPA 抢先模式同样的取舍：开启抢先开流后上游在首字节前的报错会以 SSE 错误帧呈现，而不再返回 HTTP 4xx JSON；需要保留真实错误状态码时请把 `STREAM_FAKE_THINKING_IMMEDIATE` 设为 `false`，只保留按序假思考心跳。
 
 文案的转义语义与 CPA 的 YAML 双引号对齐：`.env` 本身不做转义，因此 `STREAM_FAKE_THINKING_TEXT` 与 `STREAM_FAKE_THINKING_TEXTS` 的 `|` 写法都会由网关还原 `\n` `\r` `\t` `\\` `\"`，让线上 YAML 配置可以逐字平移；`STREAM_FAKE_THINKING_TEXTS` 的 JSON 数组写法则交给 JSON 解码器。文案开头的换行符会原样写入 `reasoning_content`（不会被裁剪），只做「纯空白即视为空项」的判断。首帧文案留空时回落到内置英文文案，与 CPA `buildEarlyThinkingChunk` 的兜底一致，中文业务应显式设置 `STREAM_FAKE_THINKING_TEXT`。
+
+**停止时机**：按序文案只在上游产出**答案正文**（`response.output_text.*`、工具调用参数）后停止注入。上游的 reasoning 事件（`response.reasoning_summary_text.delta` 等）**不算**——它们同样带 `delta` 字段，但此时下游还没拿到译文，若据此停止，后续心跳会全部退回纯注释，`STREAM_FAKE_THINKING_TEXTS` 里的文案永远轮不到（线上表现为「SSE 里只有首帧文案」）。这与断流重试用的 `contentTokenSeen` 刻意分开：后者含 reasoning 是正确的（上游一旦开始输出就不该换号重放，否则重复计费），但假思考的停止时机必须更严。
+
+**`.env` 写法约束**：`STREAM_FAKE_THINKING_TEXTS` 必须写成单行。`.env` 不支持跨行值，跨行（值后面直接换行、后续行接着写文案）会让 `godotenv` 解析失败，而解析失败时**该文件内所有配置都不生效**（包括出错行之前的）。服务在启动时会拒绝启动并打印具体行号与原因；配置生效时也会打印解析结果（`STREAM_FAKE_THINKING_TEXTS 解析出 N 条`），列表为空会明确告警，不必靠猜。
 
 上游错误消息改写（`UPSTREAM_ERROR_REWRITE_*`，迁移自 CPA 的 `error-rewrite` 补丁）按**客户端实际收到的 HTTP 状态码**生效：命中配置时只替换错误体的 `message`，并停止把上游原始 error body（含上游身份、请求 id）透给客户端。改写点覆盖非流式 JSON 出口（`sendUpstreamError`、`sendFinalUpstreamError` 的池级 503 分支、`ErrorToGinResponse`）、已提交流的 SSE 错误帧（Responses / Chat Completions / Messages / Images 的上游错误出口）、连续重试到期时的「最后一次上游失败回放」（该路径原本会原样回放上游 JSON body），以及 Grok 原生透传出口。网关自有的 `type` / `code` 会被保留，下游依赖 `code` 做重试判定时不受影响；用量日志仍记录真实上游原因，运维排查不被改写影响。`UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` 用 `|` 分隔的 `状态码=文案` 或 JSON 对象书写，`|` 写法逐项还原 `\n` 等转义；未配置的状态码在 `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` 非空时使用默认文案，否则原样透出。响应式 WebSocket 路径继续由运行时开关 `CodexWSHideErrors`（默认开启、固定文案）负责，本改写不与之叠加。
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // 本文件把 CPA 补丁（cliproxy-thinking-mask 的 _cpa-overlay）里的
@@ -115,6 +116,38 @@ func ConfigureStreamFakeThinkingFromEnv() {
 	streamFakeThinkingImmediate = streamFakeThinkingImmediateFromEnv()
 	streamFakeThinkingText = streamFakeThinkingTextFromEnv()
 	streamFakeThinkingTexts = streamFakeThinkingTextsFromEnv()
+	logStreamFakeThinkingConfig()
+}
+
+// logStreamFakeThinkingConfig 打印伪装思考的实际生效配置。
+//
+// 文案列表是这一块最容易配错又最难自查的一项：变量名写错、`|` 写成别的符号、跨行书写
+// 都会静默变成空列表，表现为「下游只有首帧假思考，后续心跳全是纯注释」，从日志里完全
+// 看不出原因。所以启动时把解析结果显式打出来。
+func logStreamFakeThinkingConfig() {
+	if !streamFakeThinkingEnabled {
+		return
+	}
+	first, source := streamFakeThinkingText, "STREAM_FAKE_THINKING_TEXT"
+	if strings.TrimSpace(first) == "" {
+		first, source = defaultFakeThinkingText, "内置默认（STREAM_FAKE_THINKING_TEXT 未配置或为空）"
+	}
+	log.Printf("[Config] 伪装思考已启用：抢先开流=%v，首帧文案来自 %s（%q）", streamFakeThinkingImmediate, source, first)
+	if len(streamFakeThinkingTexts) == 0 {
+		log.Printf("[Config] STREAM_FAKE_THINKING_TEXTS 解析出 0 条：后续心跳只会发纯注释，不再有假思考文案。" +
+			"请检查变量名与写法——需要单行、以 `|` 分隔（写 \\n 会还原成换行），或用 JSON 数组写法；" +
+			".env 里跨行书写会导致整个文件解析失败")
+		return
+	}
+	parts := make([]string, 0, len(streamFakeThinkingTexts))
+	for i, text := range streamFakeThinkingTexts {
+		if strings.TrimSpace(text) == "" {
+			parts = append(parts, fmt.Sprintf("[%d]空项(该次只发心跳)", i))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("[%d]%q", i, text))
+	}
+	log.Printf("[Config] STREAM_FAKE_THINKING_TEXTS 解析出 %d 条：%s", len(streamFakeThinkingTexts), strings.Join(parts, " "))
 }
 
 // boolFromEnv 与 decodeEnvEscapes 见 env_config.go（与上游错误改写共用同一套语义）。
@@ -162,6 +195,35 @@ func (s *fakeThinkingState) markFirstContentSeen() {
 	s.mu.Lock()
 	s.firstContentSeen = true
 	s.mu.Unlock()
+}
+
+// isReasoningOnlyEventType 报告事件是否只承载上游思考（reasoning）内容。
+//
+// 这些事件也有 delta 字段，因此 isFirstTokenResult 会判为「已出内容」；但对下游客户端
+// 而言它们不是答案正文（云翻译前端通常只渲染 content），此时停掉假思考会让后续心跳
+// 退回纯注释，STREAM_FAKE_THINKING_TEXTS 永远轮不到。
+func isReasoningOnlyEventType(eventType string) bool {
+	switch eventType {
+	case "response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.done",
+		"response.reasoning_text.delta",
+		"response.reasoning_text.done",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_part.done":
+		return true
+	}
+	return false
+}
+
+// fakeThinkingContentArrived 报告「上游已产出可见答案」，此时才停止注入假思考帧。
+//
+// 与 contentTokenSeen 的分工：后者是断流重试的判定（严格但含 reasoning——上游一旦开始
+// 输出就不该换号重放，否则重复计费），本函数只服务假思考的停止时机，刻意排除 reasoning。
+func fakeThinkingContentArrived(eventType string, parsed gjson.Result) bool {
+	if isReasoningOnlyEventType(eventType) {
+		return false
+	}
+	return isFirstTokenResult(parsed)
 }
 
 // shouldPrimeFirstBeat 报告首个心跳是否应当立即落地（抢先开流）。

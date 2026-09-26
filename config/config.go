@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -129,7 +130,16 @@ func Load(envPath string) (*Config, error) {
 	if envPath == "" {
 		envPath = ".env"
 	}
-	_ = godotenv.Load(envPath)
+	// 「文件不存在」可以静默（配置由进程环境变量提供），但「文件存在却解析失败」绝不能忽略：
+	// godotenv 解析失败时返回的 map 会被整体丢弃，也就是**该文件里所有配置都不生效**，
+	// 包括出错行之前的那些。静默忽略会让服务带着默认配置运行，且没有任何提示。
+	if err := godotenv.Load(envPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("解析 %s 失败: %w\n"+
+			"注意: 解析失败时该文件内所有配置都不会生效（包括出错行之前的）。\n"+
+			"常见原因: ① 值跨行书写——.env 不支持多行值，换行要写成字面 \\n（例如 "+
+			"STREAM_FAKE_THINKING_TEXTS=\\n第一句||\\n第二句）；② 变量名含非法字符（中文、空格）；"+
+			"③ 引号未闭合", envPath, err)
+	}
 	applyTimezone()
 
 	cfg := &Config{
