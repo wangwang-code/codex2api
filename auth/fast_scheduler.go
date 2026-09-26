@@ -591,6 +591,11 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeSta
 			if entry.acc == nil || exclude != nil && exclude[entry.dbID] || accountDispatchBlocked(entry.acc) {
 				continue
 			}
+			// 每日生效时间窗口之外实时排除：桶里的 available 是入桶时的快照，
+			// 而窗口随 now 变化（到点隔离/到点恢复），必须在这里现算。
+			if !entry.acc.InActiveWindow(now) {
+				continue
+			}
 			tier, score, limit, proven, available := entry.acc.fastSchedulerSnapshotForPolicy(s.baseLimit, now, policy)
 			tier, keepTier := s.normalizeRetainedTier(tier, expectedTier)
 			if !keepTier {
@@ -683,6 +688,10 @@ func (s *FastScheduler) acquireCandidatesOutsideLock(candidates []fastSchedulerC
 		// A slow filter can outlive a cooldown/disable/concurrency change.
 		tier, _, limit, _, available := acc.fastSchedulerSnapshotForPolicy(baseLimit, time.Now(), policy)
 		if !available || limit <= 0 || accountDispatchBlocked(acc) || accountOccupiedRequests(acc) >= limit {
+			continue
+		}
+		// 同上：窗口随 now 变化，必须在最终候选检查里现算，不能只看桶里的快照。
+		if !acc.InActiveWindow(time.Now()) {
 			continue
 		}
 		if tier != expectedTier {
@@ -820,6 +829,12 @@ func (a *Account) fastSchedulerKeepInPool(baseLimit int64, now time.Time, tier A
 	if available && limit > 0 {
 		return true
 	}
+	// 每日生效时间窗口之外不算「该踢出桶」：窗口是按时间自动恢复的，账号必须留在
+	// 索引桶里，否则窗口一到点结束就再也回不来（桶只在启动/账号变更时重建）。
+	// 是否可选由选号时的实时判定负责，见 acquireExcludingWithDispatch。
+	if !a.InActiveWindow(now) {
+		return true
+	}
 	_, _, sparkLimit, _, sparkOK := a.fastSchedulerSnapshotForSpark(baseLimit, now)
 	return sparkOK && sparkLimit > 0
 }
@@ -899,6 +914,10 @@ func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, now ti
 
 	continuationUsageOverride := continuation && a.usageLimitContinuationEligibleLocked(now)
 	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
+	// 注意：这里刻意**不含**每日生效时间窗口。available 同时被 fastSchedulerKeepInPool
+	// 用来决定账号是否留在索引桶里，若把窗口算进来，窗口外的账号会被踢出桶，窗口一到点
+	// 结束就再也回不来（桶只在启动/账号变更时重建）。窗口改为在选号的候选检查处实时
+	// 判定（见 acquireExcludingWithDispatch），这样「到点隔离」与「到点恢复」都随 now 生效。
 	if accountDispatchBlocked(a) {
 		available = false
 	}

@@ -269,3 +269,77 @@ func TestActiveWindowExcludesAccountFromPool(t *testing.T) {
 		t.Fatal("放开一个账号后应当重新有结构性候选")
 	}
 }
+
+// activeWindowOutsideNow 返回一个「保证不含当前时刻」的窗口（当前分钟之后 1 分钟）。
+// 第二个返回值为 false 表示测试刚好跨越分钟边界，调用方应当跳过。
+func activeWindowOutsideNow() (int, int, bool) {
+	now := time.Now()
+	minute := now.Hour()*60 + now.Minute()
+	return (minute + 2) % 1440, (minute + 3) % 1440, true
+}
+
+// TestActiveWindowExcludesAccountFromFastScheduler 验证索引调度引擎不会选中窗口外账号。
+//
+// 这是线上现象的回归：fastSchedulerSnapshotWithUsageOverride 复刻了 isAvailableLocked 的
+// 状态/档位/冷却/配额判定，但漏了窗口——而索引桶扫描与候选检查都拿它的 available 当最终
+// 判据，于是窗口外账号照常被选中。实测现象是：优先级 P+97 的账号 A 处于窗口外，
+// 第一次请求仍被 A 接走（在途 20s+ 后切到 B），第二次请求更是直接由 A 完成。
+func TestActiveWindowExcludesAccountFromFastScheduler(t *testing.T) {
+	start, end, ok := activeWindowOutsideNow()
+	if !ok {
+		t.Skip("测试跨越了分钟边界，跳过")
+	}
+
+	account := newFastSchedulerTestAccount(1, HealthTierHealthy, 90, 1)
+	account.SetActiveWindow(start, end)
+	if account.InActiveWindow(time.Now()) {
+		t.Skip("测试跨越了分钟边界，跳过（窗口与当前时刻重叠）")
+	}
+
+	scheduler := NewFastScheduler(1, "round_robin")
+	scheduler.Rebuild([]*Account{account})
+
+	// 阴影检查不占槽位，只回答「有没有可用候选」。
+	if scheduler.HasAvailableWithDispatch(0, nil, nil, DispatchPolicyStandard) {
+		t.Fatal("窗口外账号不应被算作可用候选")
+	}
+	if got := scheduler.Acquire(); got != nil {
+		t.Fatalf("窗口外账号不应被索引引擎选中，实际选中 account %d", got.DBID)
+	}
+
+	// 清除窗口 → 立即恢复。快照是实时计算的，不需要重建索引。
+	account.SetActiveWindow(ActiveWindowUnset, ActiveWindowUnset)
+	if !scheduler.HasAvailableWithDispatch(0, nil, nil, DispatchPolicyStandard) {
+		t.Fatal("清除窗口后应当重新有可用候选")
+	}
+	if got := scheduler.Acquire(); got == nil {
+		t.Fatal("清除窗口后应当能选中该账号")
+	}
+}
+
+// TestActiveWindowExcludesAccountFromStoreNext 用真实 Store 的 Next() 覆盖同一条路径
+// （Next → 索引引擎取号），也就是用户实际请求走的入口。
+func TestActiveWindowExcludesAccountFromStoreNext(t *testing.T) {
+	store := newSchedulerWaitTestStore(t, 2)
+
+	start, end, _ := activeWindowOutsideNow()
+	for _, account := range store.accounts {
+		account.SetActiveWindow(start, end)
+	}
+	if store.accounts[0].InActiveWindow(time.Now()) {
+		t.Skip("测试跨越了分钟边界，跳过（窗口与当前时刻重叠）")
+	}
+
+	if got := store.Next(); got != nil {
+		store.Release(got)
+		t.Fatalf("窗口外账号不应被 Next() 选中: account %d", got.DBID)
+	}
+
+	// 放开一个账号 → 立即可选。
+	store.accounts[0].SetActiveWindow(ActiveWindowUnset, ActiveWindowUnset)
+	got := store.Next()
+	if got == nil {
+		t.Fatal("清除窗口后 Next() 应当能取到账号")
+	}
+	store.Release(got)
+}
