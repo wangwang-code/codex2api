@@ -13,6 +13,15 @@ import {
   buildProxyBindingContext,
   type ProxyBindingContext,
 } from "../lib/accountProxyBinding";
+import {
+  DEFAULT_ACTIVE_WINDOW,
+  activeWindowDraftFromAccount,
+  buildActiveWindowPayload,
+  formatActiveWindowLabel,
+  isOutsideActiveWindow,
+  isOvernightWindow,
+  validateActiveWindowDraft,
+} from "../lib/accountActiveWindow";
 import Modal from "../components/Modal";
 import ChannelLogo from "../components/ChannelLogo";
 import { useVisibleChannels } from "../visibleChannels";
@@ -1444,6 +1453,19 @@ const AccountTableRow = memo(function AccountTableRow({
                             )}
                             {visibleColumns.status && (
                               <TableCell data-account-state-cell="status">
+                                {/* 生效时间窗口之外：账号被隔离但不改变自身状态（不是故障），
+                                    结论由服务端按 .env 的 TZ 计算后返回。 */}
+                                {isOutsideActiveWindow(account) ? (
+                                  <div className="mb-1.5">
+                                    <span
+                                      className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400"
+                                      title={t("accounts.activeWindowOutsideTitle")}
+                                    >
+                                      <Clock className="size-3" />
+                                      {t("accounts.activeWindowOutsideBadge")}
+                                    </span>
+                                  </div>
+                                ) : null}
                                 {tableOverlay ?? (
                                   <div
                                     className="min-w-[168px] max-w-[240px] space-y-1.5"
@@ -1909,6 +1931,15 @@ export default function Accounts() {
     useState<CodexFingerprintMode>("off");
   const [editTimezone, setEditTimezone] = useState("");
   const [editTimezoneCustom, setEditTimezoneCustom] = useState(false);
+  // 每日生效时间窗口（24 小时制）。关闭开关时提交双空串 = 清除窗口、回到全天可用。
+  // 窗口是否生效一律由服务端按 .env 的 TZ 判定，前端只负责编辑与展示。
+  const [editActiveWindowEnabled, setEditActiveWindowEnabled] = useState(false);
+  const [editActiveWindowStart, setEditActiveWindowStart] = useState(
+    DEFAULT_ACTIVE_WINDOW.start,
+  );
+  const [editActiveWindowEnd, setEditActiveWindowEnd] = useState(
+    DEFAULT_ACTIVE_WINDOW.end,
+  );
   // Turn State 强制注入:注入值 + 限定模型(逗号分隔)。仅 Codex 官方账号下发。
   const [editCodexTurnStateProxyUrl, setEditCodexTurnStateProxyUrl] = useState("");
   const [editCodexTurnStateDisabled, setEditCodexTurnStateDisabled] = useState(false);
@@ -5649,6 +5680,10 @@ export default function Accounts() {
     setEditTimezoneCustom(
       Boolean(account.timezone && !findClaudeTimezoneOption(account.timezone)),
     );
+    const activeWindowDraft = activeWindowDraftFromAccount(account);
+    setEditActiveWindowEnabled(activeWindowDraft.enabled);
+    setEditActiveWindowStart(activeWindowDraft.start);
+    setEditActiveWindowEnd(activeWindowDraft.end);
     setEditCodexTurnState(account.codex_turn_state ?? "");
     setEditCodexTurnStateProxyUrl(account.codex_turn_state_proxy_url ?? "");
     setEditCodexTurnStateDisabled(account.codex_turn_state_disabled ?? false);
@@ -5714,6 +5749,9 @@ export default function Accounts() {
     setEditCodexFingerprintMode("off");
     setEditTimezone("");
     setEditTimezoneCustom(false);
+    setEditActiveWindowEnabled(DEFAULT_ACTIVE_WINDOW.enabled);
+    setEditActiveWindowStart(DEFAULT_ACTIVE_WINDOW.start);
+    setEditActiveWindowEnd(DEFAULT_ACTIVE_WINDOW.end);
     setEditCodexTurnState("");
     setEditCodexTurnStateModels("");
     setEditTags([]);
@@ -5842,6 +5880,27 @@ export default function Accounts() {
       showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
       return;
     }
+    // 生效时间窗口：跨午夜（22:00-06:00）合法，起止相同非法（账号会一天都没有生效时刻）。
+    const activeWindowDraft = {
+      enabled: editActiveWindowEnabled,
+      start: editActiveWindowStart,
+      end: editActiveWindowEnd,
+    };
+    const activeWindowError = validateActiveWindowDraft(activeWindowDraft);
+    if (activeWindowError) {
+      showToast(
+        t(
+          activeWindowError === "invalid_start"
+            ? "accounts.activeWindowInvalidStart"
+            : activeWindowError === "invalid_end"
+              ? "accounts.activeWindowInvalidEnd"
+              : "accounts.activeWindowSameClock",
+        ),
+        "error",
+      );
+      return;
+    }
+    const activeWindowPayload = buildActiveWindowPayload(activeWindowDraft);
 
     setEditSubmitting(true);
     try {
@@ -5873,6 +5932,9 @@ export default function Accounts() {
           editSchedulerPriorityInput,
         ),
         custom_headers: parsedCustomHeaders.value,
+        // 生效时间窗口对所有账号开放（后端不区分账号类型）；关闭开关时双空串 = 清除窗口。
+        active_window_start: activeWindowPayload.active_window_start,
+        active_window_end: activeWindowPayload.active_window_end,
         // 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不下发该字段。
         ...(isCodexOfficialAccount(editingAccount)
           ? {
@@ -10015,6 +10077,73 @@ export default function Accounts() {
                             })}
                           </div>
                         ) : null}
+
+                        {/* 每日生效时间窗口 */}
+                        <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors md:col-span-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
+                              <Clock className="size-4 text-sky-500" />
+                              <span>{t("accounts.activeWindowTitle")}</span>
+                            </div>
+                            <Switch
+                              checked={editActiveWindowEnabled}
+                              onCheckedChange={setEditActiveWindowEnabled}
+                            />
+                          </div>
+                          <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                            {t("accounts.activeWindowHint")}
+                          </p>
+                          {editActiveWindowEnabled ? (
+                            <div className="mt-3 space-y-2">
+                              <div className="flex flex-wrap items-center gap-3">
+                                <label className="text-xs text-muted-foreground">
+                                  {t("accounts.activeWindowStart")}
+                                </label>
+                                <Input
+                                  type="time"
+                                  value={editActiveWindowStart}
+                                  onChange={(event) =>
+                                    setEditActiveWindowStart(event.target.value)
+                                  }
+                                  className="w-32"
+                                />
+                                <label className="text-xs text-muted-foreground">
+                                  {t("accounts.activeWindowEnd")}
+                                </label>
+                                <Input
+                                  type="time"
+                                  value={editActiveWindowEnd}
+                                  onChange={(event) =>
+                                    setEditActiveWindowEnd(event.target.value)
+                                  }
+                                  className="w-32"
+                                />
+                              </div>
+                              <p className="text-xs text-muted-foreground">
+                                {isOvernightWindow(
+                                  editActiveWindowStart,
+                                  editActiveWindowEnd,
+                                )
+                                  ? t("accounts.activeWindowOvernight", {
+                                      window: formatActiveWindowLabel(
+                                        editActiveWindowStart,
+                                        editActiveWindowEnd,
+                                      ),
+                                    })
+                                  : t("accounts.activeWindowRange", {
+                                      window: formatActiveWindowLabel(
+                                        editActiveWindowStart,
+                                        editActiveWindowEnd,
+                                      ),
+                                    })}
+                              </p>
+                            </div>
+                          ) : (
+                            <p className="mt-3 text-xs text-muted-foreground">
+                              {t("accounts.activeWindowDisabled")}
+                            </p>
+                          )}
+                        </div>
 
                         {/* Turn State 强制注入 */}
                         {isCodexOfficialAccount(editingAccount) ? (

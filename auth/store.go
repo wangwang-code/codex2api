@@ -191,11 +191,18 @@ type Account struct {
 	antigravityQuotaUsedPercent float64
 	antigravityQuotaObservedAt  time.Time
 	antigravityQuotaValid       bool
-	BaseURL                     string
-	APIKey                      string
-	Models                      []string
-	ModelMapping                string
-	CodexClientMetadataMode     string
+	// activeWindowSet 表示账号配置了每日生效时间窗口；未设置时全天可用。
+	// activeWindowStart / activeWindowEnd 是窗口起止（当天分钟数，0-1439），
+	// start > end 表示跨午夜，区间左闭右开 [start, end)。详见 active_window.go。
+	// 窗口外的账号被隔离（不参与任何选号路径），但不改变账号自身状态。
+	activeWindowSet         bool
+	activeWindowStart       int
+	activeWindowEnd         int
+	BaseURL                 string
+	APIKey                  string
+	Models                  []string
+	ModelMapping            string
+	CodexClientMetadataMode string
 	// CodexPassthroughMode 是 OpenAI Responses 中转账号的 Codex 身份透传档位
 	// （off / auto / always），见 codex passthrough 常量定义。
 	CodexPassthroughMode string
@@ -1434,6 +1441,11 @@ func (a *Account) IsAvailable() bool {
 }
 
 func (a *Account) isAvailableLocked(now time.Time) bool {
+	// 生效时间窗口之外一律不可用。这是「隔离」而不是「故障」：账号自身状态不变
+	// （不进冷却、不置封禁），时间一到自动回到调度。
+	if !a.inActiveWindowLocked(now) {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -1940,6 +1952,11 @@ func (a *Account) usageWindowBlocksFreshDispatchLocked(now time.Time) bool {
 }
 
 func (a *Account) usageLimitContinuationEligibleLocked(now time.Time) bool {
+	// 用量限制下的续链兜底同样受窗口约束：窗口外就是不该被选中，
+	// 否则「隔离」会被续链路径绕过去。
+	if !a.inActiveWindowLocked(now) {
+		return false
+	}
 	if !a.ignoreUsageLimitStatus {
 		return false
 	}
@@ -5873,6 +5890,8 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if priority, ok := row.GetCredentialInt64("scheduler_priority"); ok {
 		account.SetSchedulerPriority(priority)
 	}
+	// 每日生效时间窗口（credentials.active_window_start / _end，格式 "HH:MM"）。
+	account.loadActiveWindowFromCredentials(row)
 	account.recomputeEffectiveAutoPause(s)
 	for _, cooldown := range modelCooldowns[row.ID] {
 		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
@@ -6728,6 +6747,11 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 }
 
 func (a *Account) lazySelectableLocked(now time.Time) bool {
+	// 懒加载模式走这条路径而不经过 isAvailableLocked，窗口判定必须同样生效，
+	// 否则开启懒加载后隔离会被绕过。
+	if !a.inActiveWindowLocked(now) {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -7573,6 +7597,11 @@ func (a *Account) structurallyDispatchable() bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	// 生效时间窗口之外同样「没有归属」：窗口外账号等满等待超时也不会冒出来，
+	// 所以池级判定必须把它算作无候选，让请求快速失败而不是空等。
+	if !a.inActiveWindowLocked(time.Now()) {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -9911,6 +9940,7 @@ func (s *Store) ApplyAccountModels(dbID int64, models []string) bool {
 	return true
 }
 
+// ApplyAccountProxyURL 更新运行时账号的代理地址。
 func (s *Store) ApplyAccountProxyURL(dbID int64, proxyURL string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -9919,6 +9949,20 @@ func (s *Store) ApplyAccountProxyURL(dbID int64, proxyURL string) bool {
 	acc.mu.Lock()
 	acc.ProxyURL = strings.TrimSpace(proxyURL)
 	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountActiveWindow 更新运行时账号的每日生效时间窗口（当天分钟数）。
+// 传 ActiveWindowUnset 表示清除窗口（回到全天可用）。
+//
+// 只改内存状态：窗口判定在每次选号时实时求值，所以下一条请求就按新窗口过滤，
+// 不需要重建调度索引。
+func (s *Store) ApplyAccountActiveWindow(dbID int64, startMinute, endMinute int) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.SetActiveWindow(startMinute, endMinute)
 	return true
 }
 

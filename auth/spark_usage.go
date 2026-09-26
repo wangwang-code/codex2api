@@ -79,6 +79,11 @@ func (a *Account) SparkDispatchEligible() bool {
 }
 
 func (a *Account) sparkDispatchEligibleLocked(now time.Time) bool {
+	// Spark 策略有独立的可用性判定（dispatchableForPolicy 对 spark 走这里），
+	// 窗口隔离必须同样覆盖，否则 spark 账号会绕过。
+	if !a.inActiveWindowLocked(now) {
+		return false
+	}
 	if a.Status == StatusError || a.healthTierLocked() == HealthTierBanned {
 		return false
 	}

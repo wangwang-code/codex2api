@@ -58,6 +58,14 @@ func (h *Handler) buildAccountResponse(
 	usage7d *database.AccountTimeRangeUsage,
 	includeDetails bool,
 ) accountResponse {
+	// 每日生效时间窗口：由服务端按 .env 的 TZ 求值后返回结论，前端只做展示，
+	// 不自行按浏览器时区计算，避免展示与调度判定不一致。
+	activeWindowStart, activeWindowEnd := auth.ActiveWindowFromRow(row)
+	var inActiveWindow *bool
+	if activeWindowStart != "" && activeWindowEnd != "" {
+		value := auth.InActiveWindowForRow(row, time.Now())
+		inActiveWindow = &value
+	}
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 	isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 	isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
@@ -231,6 +239,9 @@ func (h *Handler) buildAccountResponse(
 		CodexLastRefreshAt:           row.GetCredential("codex_last_refresh_at"),
 		CodexRefreshError:            row.GetCredential("codex_refresh_error"),
 		Status:                       row.Status,
+		ActiveWindowStart:            activeWindowStart,
+		ActiveWindowEnd:              activeWindowEnd,
+		InActiveWindow:               inActiveWindow,
 		ErrorMessage:                 row.ErrorMessage,
 		ATOnly:                       !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isClaudeAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 		CreditEnabled:                row.CreditEnabled,

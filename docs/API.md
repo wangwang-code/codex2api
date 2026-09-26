@@ -853,6 +853,8 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 | `score_bias_override` | integer/null | `-200..200`；`null` 恢复套餐默认分数偏置 |
 | `base_concurrency_override` | integer/null | `≥1` 无上限；`null` 恢复分组或全局继承值 |
 | `scheduler_priority` | integer/null | `-100..100`；`null` 恢复默认优先级 `0` |
+| `active_window_start` | string | 每日生效时间窗口的起始时刻，24 小时制 `HH:MM`（如 `09:00`）。与 `active_window_end` **必须同时提供**；两端都传空串 = 清除窗口（回到全天可用）。窗口之外该账号被隔离（不参与任何选号路径），但不改变账号状态（不是冷却/禁用），到点自动恢复。时区取服务端 `.env` 的 `TZ`；区间左闭右开 `[start, end)` |
+| `active_window_end` | string | 每日生效时间窗口的结束时刻，24 小时制 `HH:MM`。`start > end` 表示跨午夜（如 `22:00`-`06:00`）；起止相同会被拒绝（账号会一天都没有生效时刻） |
 | `tags` | string[] | 替换账号标签；空数组清空 |
 | `group_ids` | integer[] | 替换账号分组；空数组清空 |
 | `timezone` | string | 绑定 IANA 时区（如 `America/New_York`）；空串清除。Codex 官方账号据此改写出站请求体 `environment_context` 里的 `<timezone>` 与 `<current_date>`（日期按账号时区与客户端时区的当日差整体平移），空=透传客户端值；中转与 Grok 账号忽略。Claude 账号沿用该字段做身份时区 |

@@ -328,6 +328,18 @@
     }
   },
   "accounts": {
+    "activeWindowTitle": "生效時間視窗",
+    "activeWindowHint": "開啟後該帳號只在指定時段參與調度，其餘時間被隔離——不改變帳號狀態（不是冷卻、不是停用），到點自動恢復。時區取伺服器 .env 的 TZ。跨午夜請把結束時刻設得早於起始時刻，例如 22:00-06:00。",
+    "activeWindowStart": "起始",
+    "activeWindowEnd": "結束",
+    "activeWindowRange": "每天 {{window}} 生效",
+    "activeWindowOvernight": "每天 {{window}} 生效（跨午夜）",
+    "activeWindowDisabled": "未啟用：全天可用",
+    "activeWindowInvalidStart": "起始時刻必須是 24 小時制 HH:MM",
+    "activeWindowInvalidEnd": "結束時刻必須是 24 小時制 HH:MM",
+    "activeWindowSameClock": "起止時刻不能相同",
+    "activeWindowOutsideBadge": "視窗外",
+    "activeWindowOutsideTitle": "目前不在生效時間視窗內，帳號被隔離（不參與調度），到點自動恢復",
     "codexTurnStateProxyLabel": "範本簽發代理（選填）",
     "codexTurnStateProxyHint": "僅用於「重新取得範本」的取得與驗證請求；留空沿用帳號預設出口。一般對話、測試連線和智力檢測繼續使用原代理。",
     "codexTurnStateProxyPoolHint": "簽發代理儲存此位址；代理池節點位址變更後，請重新選擇。",

@@ -1647,12 +1647,20 @@ type accountResponse struct {
 	SubscriptionExpiresAt   string `json:"subscription_expires_at,omitempty"`
 	// Subscription 服务端计算的订阅状态对象（业务状态 + 同步状态）；不跟踪订阅的
 	// 套餐（api/无到期时间的 free）为空。
-	Subscription          *auth.SubscriptionStatusView `json:"subscription,omitempty"`
-	Status                string                       `json:"status"`
-	ErrorMessage          string                       `json:"error_message,omitempty"`
-	ATOnly                bool                         `json:"at_only"`
-	CreditEnabled         bool                         `json:"credit_enabled"`
-	CreditSkipUsageWindow bool                         `json:"credit_skip_usage_window"`
+	Subscription *auth.SubscriptionStatusView `json:"subscription,omitempty"`
+	Status       string                       `json:"status"`
+	// ActiveWindowStart / ActiveWindowEnd 是账号每日生效时间窗口（24 小时制 "HH:MM"）；
+	// 空 = 全天可用。
+	ActiveWindowStart string `json:"active_window_start,omitempty"`
+	ActiveWindowEnd   string `json:"active_window_end,omitempty"`
+	// InActiveWindow 由服务端按 .env 的 TZ 计算，仅在配置了窗口时返回（未配置为
+	// null）。前端直接据此显示「窗口外」标记——若让前端按浏览器时区自行计算，
+	// 展示会与调度判定不一致。
+	InActiveWindow        *bool  `json:"in_active_window,omitempty"`
+	ErrorMessage          string `json:"error_message,omitempty"`
+	ATOnly                bool   `json:"at_only"`
+	CreditEnabled         bool   `json:"credit_enabled"`
+	CreditSkipUsageWindow bool   `json:"credit_skip_usage_window"`
 	// UsingCredits 是与 Status 并列的独立信号：用量窗口已打满但积分顶着，
 	// 状态仍是 active（可调度），前端据此在状态徽章旁并列一个「使用积分」徽章。
 	UsingCredits                  bool                        `json:"using_credits,omitempty"`
@@ -2169,6 +2177,8 @@ type updateAccountSchedulerReq struct {
 	ClaudeVersionPolicy     json.RawMessage `json:"claude_version_policy"`
 	ClaudeClientVersion     json.RawMessage `json:"claude_client_version"`
 	Timezone                json.RawMessage `json:"timezone"`
+	ActiveWindowStart       json.RawMessage `json:"active_window_start"`
+	ActiveWindowEnd         json.RawMessage `json:"active_window_end"`
 	CodexTurnStateProxyURL  json.RawMessage `json:"codex_turn_state_proxy_url"`
 	CodexTurnStateDisabled  json.RawMessage `json:"codex_turn_state_disabled"`
 	CodexTurnState          json.RawMessage `json:"codex_turn_state"`
@@ -2197,11 +2207,15 @@ type accountSchedulerUpdate struct {
 	ClaudeVersionPolicy     database.OptionalString
 	ClaudeClientVersion     database.OptionalString
 	Timezone                database.OptionalString
-	CodexTurnStateProxyURL  database.OptionalString
-	CodexTurnStateDisabled  database.OptionalBool
-	CodexTurnState          database.OptionalString
-	CodexTurnStateModels    database.OptionalString
-	CredentialUpdates       map[string]interface{}
+	// ActiveWindowStart / ActiveWindowEnd 是账号每日生效时间窗口（"HH:MM"）。
+	// 两者必须同时提供；同时留空表示清除窗口（回到全天可用）。
+	ActiveWindowStart      database.OptionalString
+	ActiveWindowEnd        database.OptionalString
+	CodexTurnStateProxyURL database.OptionalString
+	CodexTurnStateDisabled database.OptionalBool
+	CodexTurnState         database.OptionalString
+	CodexTurnStateModels   database.OptionalString
+	CredentialUpdates      map[string]interface{}
 }
 
 func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
@@ -2306,6 +2320,32 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	timezoneField, err := parseOptionalStringField(req.Timezone, "timezone", validateAccountTimezone)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
+	}
+	// 账号每日生效时间窗口：两个端点必须同时提供，否则语义含糊（半配置既不是
+	// 「全天可用」也不是「限定窗口」）。
+	activeWindowStart, err := parseOptionalStringField(req.ActiveWindowStart, "active_window_start", validateActiveWindowClock)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	activeWindowEnd, err := parseOptionalStringField(req.ActiveWindowEnd, "active_window_end", validateActiveWindowClock)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	if activeWindowStart.Set != activeWindowEnd.Set {
+		return accountSchedulerUpdate{}, errors.New("active_window_start 与 active_window_end 必须同时提供（同时留空表示清除窗口）")
+	}
+	if activeWindowStart.Set {
+		activeWindowStart.Value = strings.TrimSpace(activeWindowStart.Value)
+		activeWindowEnd.Value = strings.TrimSpace(activeWindowEnd.Value)
+		switch {
+		case activeWindowStart.Value == "" && activeWindowEnd.Value == "":
+			// 双空 = 清除窗口，回到全天可用。
+		case activeWindowStart.Value == "" || activeWindowEnd.Value == "":
+			return accountSchedulerUpdate{}, errors.New("active_window_start 与 active_window_end 必须同时填写或同时留空")
+		case activeWindowStart.Value == activeWindowEnd.Value:
+			// 起止相同会让账号在一天里没有任何生效时刻，属于误配置。
+			return accountSchedulerUpdate{}, errors.New("时间窗口的起止时刻不能相同")
+		}
 	}
 	codexTurnStateProxyURL, err := parseOptionalStringField(req.CodexTurnStateProxyURL, "codex_turn_state_proxy_url", func(value string) error {
 		if value == "" {
@@ -2416,6 +2456,11 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["scheduler_priority"] = int64(0)
 		}
 	}
+	if activeWindowStart.Set {
+		// 双空写入空串，等于显式清掉凭据键（回到全天可用）。
+		credentialUpdates[auth.ActiveWindowStartCredentialKey] = activeWindowStart.Value
+		credentialUpdates[auth.ActiveWindowEndCredentialKey] = activeWindowEnd.Value
+	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
 	}
@@ -2442,12 +2487,27 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ClaudeVersionPolicy:     claudeVersionPolicy,
 		ClaudeClientVersion:     claudeClientVersion,
 		Timezone:                timezoneField,
+		ActiveWindowStart:       activeWindowStart,
+		ActiveWindowEnd:         activeWindowEnd,
 		CodexTurnStateProxyURL:  codexTurnStateProxyURL,
 		CodexTurnStateDisabled:  codexTurnStateDisabled,
 		CodexTurnState:          codexTurnStateField,
 		CodexTurnStateModels:    codexTurnStateModelsField,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
+}
+
+// validateActiveWindowClock 校验账号生效时间窗口的时刻写法（24 小时制 "HH:MM"）。
+// 空串表示清除窗口，允许。
+func validateActiveWindowClock(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	if _, ok := auth.ParseActiveWindowMinute(trimmed); !ok {
+		return fmt.Errorf("时间窗口必须为 24 小时制的 HH:MM（例如 09:00 或 22:30），收到 %q", trimmed)
+	}
+	return nil
 }
 
 // validateClaudeFingerprintMode 允许空串(=跟随全局默认),其余必须是 preserve/force。
@@ -2544,7 +2604,9 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.ClaudeClientPlatform.Set ||
 		u.ClaudeVersionPolicy.Set ||
 		u.ClaudeClientVersion.Set ||
-		u.Timezone.Set
+		u.Timezone.Set ||
+		u.ActiveWindowStart.Set ||
+		u.ActiveWindowEnd.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2827,6 +2889,16 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.ProxyURL.Set {
 		h.store.ApplyAccountProxyURL(id, update.ProxyURL.Value)
+	}
+	if update.ActiveWindowStart.Set {
+		// 双空（或解析不出时刻）表示清除窗口，回到全天可用。
+		startMinute, endMinute := auth.ActiveWindowUnset, auth.ActiveWindowUnset
+		if start, okStart := auth.ParseActiveWindowMinute(update.ActiveWindowStart.Value); okStart {
+			if end, okEnd := auth.ParseActiveWindowMinute(update.ActiveWindowEnd.Value); okEnd {
+				startMinute, endMinute = start, end
+			}
+		}
+		h.store.ApplyAccountActiveWindow(id, startMinute, endMinute)
 	}
 	if value, ok := update.CredentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey].(string); ok {
 		h.store.ApplyAccountUpstreamRequestIDHeader(id, value)

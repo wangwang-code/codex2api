@@ -76,7 +76,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_SCHEDULER_MAX_WAITERS` | 否 | `4096` | 本实例账号调度等待请求总上限，正整数，重启生效。队列满立即返回可重试的 503 |
 | `CODEX_SCHEDULER_MAX_WAITERS_PER_KEY` | 否 | `256` | 本实例每个 API Key 的调度等待上限，正整数，重启生效；匿名请求共用一个计数 |
 | `FAST_SCHEDULER_ENABLED` | 否 | `false` | 旧版兼容开关；未设置 `CODEX_SCHEDULER_ENGINE` 且数据库没有 `SchedulerEngine` 时，`true` 映射为 `indexed` |
-| `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai` |
+| `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai`。决定自然日限额的零点重置等本地时间语义，**以及账号「每日生效时间窗口」的判定时区** |
 
 ### Codex 上游稳定性配置
 

@@ -23,7 +23,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			antigravity_permissions text, antigravity_entitlements text, antigravity_quota text,
 			claude_usage_probe_at text, claude_usage_probe_error text,
 			claude_auth_kind text,
-			subscription_expires_at text, subscription_sync_state text, subscription_grace_until text
+			subscription_expires_at text, subscription_sync_state text, subscription_grace_until text,
+			active_window_start text, active_window_end text
 		)`
 	credentialColumns := `
 		COALESCE(account_public.upstream_type, ''),
@@ -46,7 +47,9 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 		COALESCE(account_public.claude_auth_kind, ''),
 		COALESCE(account_public.subscription_expires_at, ''),
 		COALESCE(account_public.subscription_sync_state, ''),
-		COALESCE(account_public.subscription_grace_until, '')`
+		COALESCE(account_public.subscription_grace_until, ''),
+		COALESCE(account_public.active_window_start, ''),
+		COALESCE(account_public.active_window_end, '')`
 	if db.isSQLite() {
 		upstreamExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 		fromClause = `FROM accounts`
@@ -71,7 +74,9 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			COALESCE(json_extract(credentials, '$.claude_auth_kind'), ''),
 			COALESCE(json_extract(credentials, '$.subscription_expires_at'), ''),
 			COALESCE(json_extract(credentials, '$.subscription_sync_state'), ''),
-			COALESCE(json_extract(credentials, '$.subscription_grace_until'), '')`
+			COALESCE(json_extract(credentials, '$.subscription_grace_until'), ''),
+			COALESCE(json_extract(credentials, '$.active_window_start'), ''),
+			COALESCE(json_extract(credentials, '$.active_window_end'), '')`
 	}
 	where += accountChannelFilterSQL(channel, upstreamExpr)
 	query := `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
@@ -114,6 +119,9 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	var antigravitySyncError, antigravitySyncWarning, antigravityPermissions, antigravityQuota string
 	var claudeUsageProbeAt, claudeUsageProbeError, claudeAuthKind string
 	var subscriptionExpiresAt, subscriptionSyncState, subscriptionGraceUntil string
+	// 账号每日生效时间窗口（credentials.active_window_start / _end，格式 "HH:MM"）。
+	// 列表要展示「窗口外」标记，因此必须随投影一起取出。
+	var activeWindowStart, activeWindowEnd string
 	var modelsRaw interface{}
 	var hasAPIKey, hasRefreshToken, verifiedEmail bool
 	if err := scanner.Scan(
@@ -126,6 +134,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		&antigravitySyncError, &antigravitySyncWarning, &antigravityPermissions, &antigravityQuota,
 		&claudeUsageProbeAt, &claudeUsageProbeError, &claudeAuthKind,
 		&subscriptionExpiresAt, &subscriptionSyncState, &subscriptionGraceUntil,
+		&activeWindowStart, &activeWindowEnd,
 	); err != nil {
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
 	}
@@ -196,6 +205,13 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	}
 	if trimmed := strings.TrimSpace(subscriptionGraceUntil); trimmed != "" {
 		row.Credentials["subscription_grace_until"] = trimmed
+	}
+	// 时间窗口只在两端都配齐时才写入，避免半配置被下游当成有效窗口。
+	if start := strings.TrimSpace(activeWindowStart); start != "" {
+		if end := strings.TrimSpace(activeWindowEnd); end != "" {
+			row.Credentials["active_window_start"] = start
+			row.Credentials["active_window_end"] = end
+		}
 	}
 	if models := decodeProjectionStringSlice(modelsRaw); len(models) > 0 {
 		row.Credentials["models"] = models

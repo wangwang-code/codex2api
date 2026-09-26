@@ -212,6 +212,8 @@ func (db *DB) installSQLiteSchedulerOutboxTriggers(ctx context.Context) error {
 		  OR COALESCE(json_extract(OLD.credentials,'$.plan_type'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.plan_type'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.dispatch_count_limit'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.dispatch_count_limit'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.scheduler_priority'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.scheduler_priority'),'')
+		  OR COALESCE(json_extract(OLD.credentials,'$.active_window_start'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.active_window_start'),'')
+		  OR COALESCE(json_extract(OLD.credentials,'$.active_window_end'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.active_window_end'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.auth_mode'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.auth_mode'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.agent_runtime_id'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.agent_runtime_id'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.agent_private_key'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.agent_private_key'),'')
@@ -359,6 +361,8 @@ func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error 
 			COALESCE(OLD.credentials->>'plan_type','') IS DISTINCT FROM COALESCE(NEW.credentials->>'plan_type','') OR
 			COALESCE(OLD.credentials->>'dispatch_count_limit','') IS DISTINCT FROM COALESCE(NEW.credentials->>'dispatch_count_limit','') OR
 			COALESCE(OLD.credentials->>'scheduler_priority','') IS DISTINCT FROM COALESCE(NEW.credentials->>'scheduler_priority','') OR
+			COALESCE(OLD.credentials->>'active_window_start','') IS DISTINCT FROM COALESCE(NEW.credentials->>'active_window_start','') OR
+			COALESCE(OLD.credentials->>'active_window_end','') IS DISTINCT FROM COALESCE(NEW.credentials->>'active_window_end','') OR
 			COALESCE(OLD.credentials->>'auth_mode','') IS DISTINCT FROM COALESCE(NEW.credentials->>'auth_mode','') OR
 			COALESCE(OLD.credentials->>'agent_runtime_id','') IS DISTINCT FROM COALESCE(NEW.credentials->>'agent_runtime_id','') OR
 			COALESCE(OLD.credentials->>'agent_private_key','') IS DISTINCT FROM COALESCE(NEW.credentials->>'agent_private_key','') OR

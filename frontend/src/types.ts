@@ -286,6 +286,14 @@ export interface AccountRow {
   /** 服务端按业务时区计算的订阅状态对象;不跟踪订阅的套餐(api/无到期时间的 free)缺省。 */
   subscription?: SubscriptionStatus
   status: AccountStatus
+  /** 每日生效时间窗口（24 小时制 "HH:MM"）；缺省表示全天可用。 */
+  active_window_start?: string
+  active_window_end?: string
+  /**
+   * 服务端按 .env 的 TZ 计算的结论，仅在配置了窗口时返回。
+   * false = 当前在窗口外（账号被隔离，不参与调度）；前端不自行按浏览器时区计算。
+   */
+  in_active_window?: boolean
   error_message?: string
   at_only?: boolean
   access_token_type?: string
@@ -1496,6 +1504,9 @@ export interface UpdateAccountSchedulerRequest {
   claude_version_policy?: 'passthrough' | 'fixed' | 'minimum' | null
   claude_client_version?: string | null
   timezone?: string | null
+  /** 每日生效时间窗口（24 小时制 "HH:MM"）。两者必须同时提供；同时留空表示清除窗口。 */
+  active_window_start?: string | null
+  active_window_end?: string | null
   codex_turn_state_proxy_url?: string | null
   codex_turn_state_disabled?: boolean | null
   codex_turn_state?: string | null
