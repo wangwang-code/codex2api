@@ -62,9 +62,16 @@ type streamLimitRule struct {
 	MaxChars int `json:"max-chars"`
 
 	// MaxStreamDuration 是单次上游流的墙钟上限（Go duration 字面量，如 "55s"）。
+	// 注意它是**绝对墙钟**且只在事件到达时判定：上游彻底静默时不会触发（见 StallTimeout）。
 	MaxStreamDuration string `json:"max-stream-duration"`
 	// MaxUpstreamBytes 是单次上游流读取的原始字节上限（兜底，不数下游帧）。
 	MaxUpstreamBytes int `json:"max-upstream-bytes"`
+
+	// StallTimeout 是「首个上游事件之后空闲多久算挂死」的上游流停顿看门狗
+	// （Go duration 字面量，如 "12s"；移植自 CPA 的 streaming.stall-timeout）。
+	// 留空则回落到全局 STREAM_STALL_TIMEOUT。它与上面三个判据互补：那三个都只在
+	// 事件到达时才判定，上游一旦静默就永远不触发，只能等客户端自己超时。
+	StallTimeout string `json:"stall-timeout"`
 }
 
 // streamLimitBudget 是某个请求解析后的预算；零值表示不限。
@@ -122,6 +129,14 @@ func logStreamLimitRuleCurve(rule streamLimitRule) {
 		shortInput, computeStreamContentChars(rule, shortInput),
 		midInput, computeStreamContentChars(rule, midInput),
 		longInput, computeStreamContentChars(rule, longInput))
+
+	// 停顿看门狗与预算曲线配套才看得懂：预算管「产出多少」，停顿管「还活着没有」。
+	// 规则里没配就明确打出回落全局，避免运维以为这条规则已经布防。
+	if timeout := parseStreamStallTimeout(rule.StallTimeout); timeout > 0 {
+		log.Printf("[Config] 流预算规则 %q：停顿看门狗 %s（首个上游事件后空闲超过该时长即中止，终态 stream_stall）", rule.Name, timeout)
+	} else if streamStallTimeout > 0 {
+		log.Printf("[Config] 流预算规则 %q：未配 stall-timeout，停顿看门狗沿用全局 %s", rule.Name, streamStallTimeout)
+	}
 
 	if rule.MaxChars <= 0 || rule.CharsPerInputChar <= 0 {
 		return

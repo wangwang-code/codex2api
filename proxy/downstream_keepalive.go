@@ -33,6 +33,7 @@ func ConfigureFromEnv() {
 	ConfigureUpstreamErrorRewriteFromEnv()
 	ConfigureDispatchWaitFromEnv()
 	ConfigureStreamLimitsFromEnv()
+	ConfigureStreamStallFromEnv()
 	ConfigureNotifyFromEnv()
 }
 

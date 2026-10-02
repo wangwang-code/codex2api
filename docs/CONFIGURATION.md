@@ -115,7 +115,8 @@ Codex2API 采用三层配置架构：
 | `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` | 否 | 空 | 未在下面列出的状态码使用的默认文案；留空表示这些状态码原样透出 |
 | `UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` | 否 | 空 | 状态码到文案的映射。`\|` 分隔的 `状态码=文案`，或 JSON 对象；`\|` 写法逐项还原转义 |
 | `STREAM_LIMITS_ENABLED` | 否 | `false` | 上游流预算总开关。开启后按规则匹配请求，限制单次上游流的输出内容字符数、墙钟时长与上游原始字节数，超出即中止并向客户端返回固定 payload |
-| `STREAM_LIMITS_RULES` | 否 | 空 | 规则列表（JSON 数组，按顺序匹配，第一条命中即生效）。字段：`name` / `api-keys` / `models` / `base-chars` / `chars-per-input-char` / `min-chars` / `max-chars` / `max-stream-duration` / `max-upstream-bytes`。`api-keys` 与 `models` **留空即匹配任意**，不是必填；`models` 匹配的是客户端请求的模型名（与用量页 `model` 列一致），不是网关模型映射后的名字 |
+| `STREAM_LIMITS_RULES` | 否 | 空 | 规则列表（JSON 数组，按顺序匹配，第一条命中即生效）。字段：`name` / `api-keys` / `models` / `base-chars` / `chars-per-input-char` / `min-chars` / `max-chars` / `max-stream-duration` / `max-upstream-bytes` / `stall-timeout`。`api-keys` 与 `models` **留空即匹配任意**，不是必填；`models` 匹配的是客户端请求的模型名（与用量页 `model` 列一致），不是网关模型映射后的名字 |
+| `STREAM_STALL_TIMEOUT` | 否 | `0`（关闭） | 上游流停顿看门狗的全局默认值（移植自 CPA 的 `streaming.stall-timeout`）。**首个上游事件之后**空闲超过该时长即中止该流，用量日志记 `stream_stall`。规则里的 `stall-timeout` 优先于本项。它管「空闲」不管「总时长」：匀速慢吐的失控流不会命中，那一段由 `max-stream-duration` / 内容预算兜底 |
 | `NOTIFY_WEBHOOK_URL` | 否 | 空 | 事件通知的 webhook 地址。留空则整个通知模块关闭，不发任何请求 |
 | `NOTIFY_WEBHOOK_FORMAT` | 否 | `json` | webhook 载荷格式：`telegram`（GET，把消息拼成 `<url>&text=<urlencoded>`，别名 `tg` / `query`，Telegram Bot API 用这个）/ `json`（`{"text":"..."}`）/ `text`（纯文本）/ `wecom`（企业微信）/ `feishu`（飞书）/ `dingtalk`（钉钉） |
 
@@ -356,6 +357,17 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 上游错误消息改写（`UPSTREAM_ERROR_REWRITE_*`，迁移自 CPA 的 `error-rewrite` 补丁）按**客户端实际收到的 HTTP 状态码**生效：命中配置时只替换错误体的 `message`，并停止把上游原始 error body（含上游身份、请求 id）透给客户端。改写点覆盖非流式 JSON 出口（`sendUpstreamError`、`sendFinalUpstreamError` 的池级 503 分支、`ErrorToGinResponse`）、已提交流的 SSE 错误帧（Responses / Chat Completions / Messages / Images 的上游错误出口）、连续重试到期时的「最后一次上游失败回放」（该路径原本会原样回放上游 JSON body），以及 Grok 原生透传出口。网关自有的 `type` / `code` 会被保留，下游依赖 `code` 做重试判定时不受影响；用量日志仍记录真实上游原因，运维排查不被改写影响。`UPSTREAM_ERROR_REWRITE_STATUS_MESSAGES` 用 `|` 分隔的 `状态码=文案` 或 JSON 对象书写，`|` 写法逐项还原 `\n` 等转义；未配置的状态码在 `UPSTREAM_ERROR_REWRITE_DEFAULT_MESSAGE` 非空时使用默认文案，否则原样透出。响应式 WebSocket 路径继续由运行时开关 `CodexWSHideErrors`（默认开启、固定文案）负责，本改写不与之叠加。
 
 上游流预算（`STREAM_LIMITS_*`，迁移自 CPA 的 `stream-limits` 补丁）防止上游模型「输出失控」——不按预期翻译、无限输出、长时间挂着不下线。命中规则时按输入字符数线性推导**输出内容字符**预算，并可选限制墙钟时长与上游原始读取字节；超出即中止上游流，按已提交/未提交流分别以 SSE 错误帧或 502 JSON 返回固定 payload `{"error":{"message":"模型输出失控，已中止","type":"server_error","param":null,"code":"upstream_response_too_large"}}`，并按请求级终态处理（不换号重试——输出失控与账号无关，换号只会再跑一遍同样失控的输出）。用量日志会以 `upstream_error_kind=stream_budget` 记录，且**不参与上游错误消息改写**（它是本地请求级失败，改写会把「输出失控」盖成「上游服务不可用」）。
+
+上游流停顿看门狗（`STREAM_STALL_TIMEOUT`，或 `STREAM_LIMITS_RULES` 规则内 `stall-timeout`；迁移自 CPA 的 `streaming.stall-timeout`）补的是上面那条链路的唯一缺口：**预算的三条判据都只在「上游事件到达时」判定**（`observe` 由读流回调驱动，墙钟判据同样没有自己的定时器），所以上游在发完 `response.created` 或若干个 delta 之后半开挂死时，三条判据一条都不会命中——请求只能挂着等客户端超时。停顿看门狗在**首个上游事件**（含握手帧）之后起算、每个上游事件重置计时，空闲超过配置值即中止上游读取；终态记为 `upstream_error_kind=stream_stall`（内部 598）：零写入时按上游故障进入既有重试链换号，已写出正文时补流内断流事件且不补 `[DONE]`；非流式请求显式返回 502 + `code=upstream_stream_break`，不会把半截正文当 200 返回。它管的是**空闲**不是**总时长**——匀速慢吐的失控流不会命中，那一段仍由内容预算 / `max-stream-duration` 负责。
+
+各守卫覆盖的时间段（分工，不是重复；默认值下多数守卫是关闭的，需要按线路显式打开）：
+
+| 时间段 | 覆盖机制 |
+| --- | --- |
+| 请求入口 → 上游首事件 | `first_token_timeout_seconds`（运行时设置，默认 `0` = 关闭；关闭时这一段没有网关侧上限） |
+| 上游首事件 → 流结束：**空闲** | `stall-timeout` / `STREAM_STALL_TIMEOUT`（默认关闭） |
+| 上游首事件 → 流结束：**产出总量** | `base-chars + 输入字符 × chars-per-input-char` 等内容预算（默认关闭） |
+| 上游首事件 → 流结束：**总墙钟** | `max-stream-duration`（**只在事件到达时判定**，上游静默时不触发） |
 
 事件通知（`NOTIFY_WEBHOOK_*`）把三类运维事件推到 webhook：**账号 401**（哪个号被上游拒了，带账号 id/email/plan 与上游错误摘要）、**codex 池打空**（服务降级：全部 codex 账号不可用，流量已切到中转兜底）、**codex 池恢复**（重新有可用 codex 账号）。判定口径是「codex 官方号池」——codex 渠道下、非中转、非 Grok / Antigravity / Claude；中转（OpenAI Responses API）是降级后的去处，不算在内。只在**状态翻转**时通知（不会每个 401 都刷一条降级），投递异步且带 5s 超时，webhook 慢或挂都不影响请求链路，失败只记日志。未配置 `NOTIFY_WEBHOOK_URL` 时整个模块关闭，零开销。
 

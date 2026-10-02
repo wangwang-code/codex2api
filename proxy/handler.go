@@ -6846,6 +6846,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// model：操作者是照着客户端发的模型名配规则的，用映射后名字会静默不命中。
 	streamLimit := newStreamLimitStateForRequest(c, logModel, rawBody)
 	streamLimitBreached := false
+	// 上游流停顿看门狗（移植 CPA 的 streaming.stall-timeout）：首个上游事件之后空闲多久算挂死。
+	// 与流预算互补——预算的三个判据（内容字符/原始字节/墙钟）都只在事件到达时判定，
+	// 上游彻底静默时它永远不会触发，那一段只能靠这个空闲看门狗兜（见 stream_stall.go）。
+	// 规则内 stall-timeout 优先，未配置回落全局 STREAM_STALL_TIMEOUT（默认关闭）。
+	stallTimeout := streamStallTimeoutForRequest(apiKeyFromContext(c), logModel)
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -7062,6 +7067,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+		// 停顿看门狗按 attempt 重建：cancel 必须绑定本轮的上游上下文，上一轮的残留
+		// 定时器会 cancel 掉已经作废的上下文（下一轮 attempt 顶部还会再 cancel 一次）。
+		stallGuard := newStreamStallGuard(stallTimeout, upstreamCancel)
 		var resp *http.Response
 		var reqErr error
 		if account.IsAntigravityAPI() {
@@ -7275,12 +7283,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}) {
 		case grokQualityGuardRetry:
 			ttftGuard.Stop()
+			stallGuard.Stop()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 			continue
 		case grokQualityGuardFailClosed:
 			ttftGuard.Stop()
+			stallGuard.Stop()
 			h.store.Release(account)
 			h.sendGrokNativeHTTPError(c, GrokProtocolChatCompletions, grokQualityDegradedOutcome())
 			return
@@ -7451,6 +7461,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					}
 				}
 				ttftGuard.MarkProgress(eventType)
+				// 任何上游事件都证明流还活着：首个事件启动停顿看门狗，之后逐个重置空闲计时。
+				stallGuard.MarkEvent()
 				isFirstToken := isLooseFirstTokenResult(parsed)
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
@@ -7614,6 +7626,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					return false
 				}
 				ttftGuard.MarkProgress(eventType)
+				// 非流式下游同样在等这一个流：上游静默时这里也没有任何事件可判，
+				// 停顿看门狗是唯一能在「挂死」时把请求结束掉的机制。
+				stallGuard.MarkEvent()
 				if !ttftRecorded && isLooseFirstTokenResult(parsed) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -7680,7 +7695,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
+		// 上游流停顿中止：既不是上游给的失败帧、也不是下游断开，而是本地按空闲超时
+		// 判定的上游挂死。放在 ttft 之后——两者接力（首字看门狗在首个事件就停，
+		// 停顿看门狗才刚起算），同时触发只可能是终态恰好压着超时到达，此时按终态放行。
+		if stallGuard.Fired() && !gotTerminal {
+			outcome = streamStallOutcome(stallGuard.Timeout())
+		}
 		ttftGuard.Stop()
+		stallGuard.Stop()
 		if outcome.verifyAccountAuth {
 			h.store.VerifyAccountAuthAsync(account)
 		}
@@ -7826,6 +7848,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			} else if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
+			} else if isStreamStallOutcome(outcome) {
+				// 非流式遇到停顿中止时必须报错：compactResult 是「读完流就构建」的，
+				// 这里一定非空——照原样走 200 会把半截译文当完整译文交给客户端，
+				// 而调用方（翻译类 App）没有任何可编程信号能发现被截断。
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
 				})
 			} else if compactResult != nil {
 				c.Data(http.StatusOK, "application/json", compactResult)
