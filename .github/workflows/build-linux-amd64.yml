@@ -55,7 +55,10 @@ jobs:
             -ldflags="-s -w -X github.com/codex2api/internal/version.Version=${version}" \
             -o dist/codex2api-linux-amd64 .
           file dist/codex2api-linux-amd64
-          sha256sum dist/codex2api-linux-amd64 | tee dist/SHA256SUMS.txt
+          # Checksum lines must carry the bare filename: the artifact packaging strips
+          # the "dist/" prefix, so a "dist/codex2api-linux-amd64" entry would fail
+          # `sha256sum -c SHA256SUMS.txt` right after `gh run download`.
+          (cd dist && sha256sum codex2api-linux-amd64 | tee SHA256SUMS.txt)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
