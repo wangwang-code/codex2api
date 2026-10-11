@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/codex2api/security"
 )
 
 // OpenAI OAuth 常量（与 CLIProxyAPI / sub2api 一致）
@@ -604,7 +606,7 @@ func buildHTTPClientChecked(proxyURL string, strict bool) (*http.Client, error) 
 	proxyURL = strings.TrimSpace(proxyURL)
 	if strict && proxyURL != "" {
 		probe := &http.Transport{}
-		if err := ConfigureTransportProxy(probe, proxyURL, &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}); err != nil {
+		if err := ConfigureTransportProxy(probe, proxyURL, security.NewDialer(10*time.Second, 30*time.Second)); err != nil {
 			return nil, fmt.Errorf("configure proxy: %w", err)
 		}
 		probe.CloseIdleConnections()
@@ -622,7 +624,7 @@ func buildHTTPClientChecked(proxyURL string, strict bool) (*http.Client, error) 
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	baseDialer := security.NewDialer(10*time.Second, 30*time.Second)
 	transport.DialContext = baseDialer.DialContext
 	if proxyURL != "" {
 		if err := ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {

@@ -6,11 +6,12 @@ import (
 	"log"
 	"math"
 	"math/rand"
-	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/codex2api/security"
 )
 
 // ProxyHealthStatus 代理健康状态
@@ -525,20 +526,14 @@ func (p *ProxyPool) checkProxy(ctx context.Context, entry *ProxyEntry) *HealthCh
 
 	// 创建带代理的 transport
 	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:       security.NewDialer(5*time.Second, 30*time.Second).DialContext,
 		DisableKeepAlives: true, // 禁用 keep-alive 避免连接泄漏
 		MaxIdleConns:      0,
 		IdleConnTimeout:   0,
 	}
 
 	// 配置代理
-	if err := ConfigureTransportProxy(transport, entry.URL, &net.Dialer{
-		Timeout:   5 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}); err != nil {
+	if err := ConfigureTransportProxy(transport, entry.URL, security.NewDialer(5*time.Second, 30*time.Second)); err != nil {
 		return &HealthCheckResult{
 			URL:       entry.URL,
 			Healthy:   false,

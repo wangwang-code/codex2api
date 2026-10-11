@@ -10,6 +10,7 @@ import (
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -122,12 +123,15 @@ func (h *Handler) dialLiveSideband(ctx context.Context, record *liveCallRecord) 
 	}
 	account := h.liveAccountForRecord(record)
 	target := strings.TrimRight(chatGPTLiveSidebandBaseURL, "/") + "/" + url.PathEscape(record.CallID)
-	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		// 直连也套用强制 hosts 覆盖；显式代理在下面覆盖。
+		NetDialContext: security.NewDialer(0, 0).DialContext,
+	}
 	if account != nil && h.store != nil {
 		if proxyURL := strings.TrimSpace(h.store.ResolveProxyForAccount(account)); proxyURL != "" {
-			if parsed, parseErr := url.Parse(proxyURL); parseErr == nil {
-				dialer.Proxy = http.ProxyURL(parsed)
-			}
+			// 代理非法时沿用既有宽松行为：忽略并退回直连。
+			_ = applyProxyURLIfSet(&dialer, proxyURL)
 		}
 	}
 	conn, resp, err := dialer.DialContext(ctx, target, headers)

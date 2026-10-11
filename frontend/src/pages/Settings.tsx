@@ -2224,6 +2224,7 @@ export default function Settings() {
     codex_ws_stateless_slots: 8,
     github_token_configured: false,
     github_proxy_url: '',
+    proxy_health_check_url: '',
     codex_overload_pause_enabled: false,
     codex_overload_threshold_percent: 20,
     codex_overload_pause_minutes: 30,
@@ -5674,6 +5675,24 @@ export default function Settings() {
                       placeholder="http://host:port / socks5://host:port"
                       onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, github_proxy_url: e.target.value }))}
                       onBlur={(e: FocusEvent<HTMLInputElement>) => autoSaveStringField('github_proxy_url', e.target.value.trim())}
+                    />
+                  </SettingField>
+                </div>
+              </SettingsCard>
+
+              <SettingsCard
+                title={t('settings.proxyHealthCheck')}
+                description={t('settings.proxyHealthCheckDesc')}
+                icon={<Activity className="size-4" />}
+                channels={ALL_UPSTREAM_CHANNELS}
+              >
+                <div className="space-y-4">
+                  <SettingField label={t('settings.proxyHealthCheckUrl')} description={t('settings.proxyHealthCheckUrlDesc')}>
+                    <Input
+                      value={settingsForm.proxy_health_check_url}
+                      placeholder="https://auth.openai.com/cdn-cgi/trace"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, proxy_health_check_url: e.target.value }))}
+                      onBlur={(e: FocusEvent<HTMLInputElement>) => autoSaveStringField('proxy_health_check_url', e.target.value.trim())}
                     />
                   </SettingField>
                 </div>

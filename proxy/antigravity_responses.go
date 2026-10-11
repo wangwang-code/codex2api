@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/security"
 	"github.com/tidwall/gjson"
 )
 
@@ -345,7 +345,7 @@ func antigravityHTTPClient(accountID int64, proxyURL string) (*http.Client, erro
 		return cached.(*http.Client), nil
 	}
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 60 * time.Second}
+	dialer := security.NewDialer(10*time.Second, 60*time.Second)
 	transport := &http.Transport{
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     false,

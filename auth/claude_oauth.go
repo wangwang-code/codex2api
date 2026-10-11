@@ -32,6 +32,8 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+
+	"github.com/codex2api/security"
 )
 
 // Claude OAuth 配置常量。对齐 Claude Code 官方客户端在链路上的取值。
@@ -284,6 +286,8 @@ func buildPlainClaudeOAuthClient(proxyURL string) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	if strings.TrimSpace(proxyURL) != "" {
 		_ = ConfigureTransportProxy(tr, proxyURL, nil)
+	} else {
+		security.ApplyHostsOverrideToTransport(tr)
 	}
 	return &http.Client{Transport: tr, Timeout: claudeOAuthHTTPTimeout}
 }

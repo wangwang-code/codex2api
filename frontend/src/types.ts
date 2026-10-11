@@ -2118,6 +2118,8 @@ export interface SystemSettings {
   github_token?: string
   github_token_configured?: boolean
   github_proxy_url: string
+  // 代理检测/健康检查目标 URL；留空沿用内置检测目标（ip-api 出口 IP + IPv6 echo）。
+  proxy_health_check_url: string
   // Codex 过载熔断：窗口内 server_is_overloaded 占比达阈值自动暂停调度
   codex_overload_pause_enabled: boolean
   codex_overload_threshold_percent: number

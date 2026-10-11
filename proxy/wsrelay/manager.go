@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -120,20 +119,11 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 
 // configureWebsocketDialerProxy applies the configured proxy to a Gorilla
 // WebSocket dialer. Gorilla accepts "socks5" but not the curl-style
-// "socks5h" alias. Its SOCKS5 implementation already sends domain names to
-// the proxy, so normalizing the alias preserves remote DNS resolution.
+// "socks5h" alias; the shared helper normalizes the alias and, when the global
+// forced-hosts override is enabled, switches to a self-built tunnel so the
+// target address is forced to an explicit IP as well.
 func configureWebsocketDialerProxy(dialer *websocket.Dialer, rawProxyURL string) error {
-	parsed, err := security.ParseProxyURL(rawProxyURL)
-	if err != nil {
-		return fmt.Errorf("parse proxy URL failed: %w", err)
-	}
-
-	parsed.Scheme = strings.ToLower(strings.TrimSpace(parsed.Scheme))
-	if parsed.Scheme == "socks5h" {
-		parsed.Scheme = "socks5"
-	}
-	dialer.Proxy = http.ProxyURL(parsed)
-	return nil
+	return proxy.ApplyWebsocketProxy(dialer, rawProxyURL)
 }
 
 // NewWsConnection 创建 WebSocket 连接
@@ -330,10 +320,7 @@ func NewManager() *Manager {
 			ReadBufferSize:  64 * 1024,
 			WriteBufferSize: 64 * 1024,
 			WriteBufferPool: wsWriteBufferPool,
-			NetDialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			NetDialContext:  security.NewDialer(30*time.Second, 30*time.Second).DialContext,
 		},
 		stopCleanup: make(chan struct{}),
 	}

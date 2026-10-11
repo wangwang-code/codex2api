@@ -36,11 +36,11 @@ const (
 )
 
 func newUTLSAuthTransport(proxyURL string) http.RoundTripper {
-	var dialer xproxy.Dialer = xproxy.Direct
+	var dialer xproxy.Dialer = security.NewDialer(0, 0)
 	if proxyURL != "" {
 		d, err := buildAuthProxyDialer(proxyURL)
 		if err != nil {
-			dialer = xproxy.Direct
+			dialer = security.NewDialer(0, 0)
 		} else {
 			dialer = d
 		}
@@ -198,12 +198,15 @@ type authHTTPConnectDialer struct {
 }
 
 func (d *authHTTPConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", d.proxyAddr, 10*time.Second)
+	// 代理端点与 CONNECT 目标都按强制 hosts 覆盖改成显式 IP：前者解决代理域名
+	// 解析问题，后者让代理解析目标域名的环节彻底消失。
+	conn, err := net.DialTimeout("tcp", security.RewriteHostPort(d.proxyAddr), 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理服务器失败: %w", err)
 	}
 
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+	target := security.RewriteHostPort(addr)
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
 	if d.authHeader != "" {
 		connectReq += fmt.Sprintf("Proxy-Authorization: %s\r\n", d.authHeader)
 	}
@@ -270,7 +273,13 @@ func buildAuthSOCKS5Dialer(u *url.URL) (xproxy.Dialer, error) {
 		password, _ := u.User.Password()
 		auth = &xproxy.Auth{User: u.User.Username(), Password: password}
 	}
-	return xproxy.SOCKS5("tcp", u.Host, auth, xproxy.Direct)
+	// forward 用覆盖感知拨号器（代理端点域名→IP）；返回的 dialer 再包一层
+	// TargetRewriteDialer，让 SOCKS5 请求里的目标也用 IP 下发，绕开代理侧远端解析。
+	dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, security.NewDialer(0, 0))
+	if err != nil {
+		return nil, err
+	}
+	return security.TargetRewriteDialer{Inner: socksDialerAdapter{d: dialer}}, nil
 }
 
 // ---- uTLS client pool (带 TTL 清理) ----

@@ -377,6 +377,8 @@ func (p *openAIResponsesWSPool) dial(ctx context.Context, spec openAIResponsesWS
 		HandshakeTimeout:  30 * time.Second,
 		EnableCompression: true,
 		Proxy:             http.ProxyFromEnvironment,
+		// 直连/经环境变量代理时同样套用强制 hosts 覆盖；显式代理在下面覆盖。
+		NetDialContext: security.NewDialer(0, 0).DialContext,
 	}
 	if spec.proxyURL != "" {
 		if err := configureOpenAIResponsesWSProxy(dialer, spec.proxyURL); err != nil {
@@ -408,16 +410,7 @@ func (p *openAIResponsesWSPool) dial(ctx context.Context, spec openAIResponsesWS
 }
 
 func configureOpenAIResponsesWSProxy(dialer *websocket.Dialer, rawProxyURL string) error {
-	parsed, err := security.ParseProxyURL(rawProxyURL)
-	if err != nil {
-		return fmt.Errorf("parse proxy URL failed: %w", err)
-	}
-	parsed.Scheme = strings.ToLower(strings.TrimSpace(parsed.Scheme))
-	if parsed.Scheme == "socks5h" {
-		parsed.Scheme = "socks5"
-	}
-	dialer.Proxy = http.ProxyURL(parsed)
-	return nil
+	return ApplyWebsocketProxy(dialer, rawProxyURL)
 }
 
 func openAIResponsesWSHandshakeResponse(err error, resp *http.Response) (*http.Response, error) {

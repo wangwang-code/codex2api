@@ -3645,6 +3645,7 @@ type Store struct {
 	continuousRetryPolicy atomic.Value // database.ContinuousRetryPolicy（默认关闭）
 	githubToken           atomic.Value // GitHub API token，仅发给 api.github.com（issue #522）
 	githubProxyURL        atomic.Value // GitHub 域名专用出站代理，空回落全局/环境代理（issue #522）
+	proxyHealthCheckURL   atomic.Value // 代理检测目标 URL，空表示沿用内置检测目标
 
 	// 新导入/新建 Codex 账号默认盖上的指纹收敛档位: off / device / session / full
 	codexFingerprintDefaultMode atomic.Value
@@ -4354,6 +4355,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexFingerprintDefaultMode.Store(NormalizeCodexFingerprintMode(settings.CodexFingerprintDefaultMode))
 	s.githubToken.Store(strings.TrimSpace(settings.GithubToken))
 	s.githubProxyURL.Store(strings.TrimSpace(settings.GithubProxyURL))
+	s.proxyHealthCheckURL.Store(strings.TrimSpace(settings.ProxyHealthCheckURL))
 	s.SetModelCooldownSettings(database.ModelCooldownSettings{
 		RelayMode:           settings.RelayModelCooldownMode,
 		RelaySeconds:        settings.RelayModelCooldownSeconds,
@@ -4778,6 +4780,25 @@ func (s *Store) GithubProxyURL() string {
 		return ""
 	}
 	if v, ok := s.githubProxyURL.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// SetProxyHealthCheckURL 设置代理检测/健康检查的目标 URL（空表示沿用内置检测目标）。
+func (s *Store) SetProxyHealthCheckURL(rawURL string) {
+	if s == nil {
+		return
+	}
+	s.proxyHealthCheckURL.Store(strings.TrimSpace(rawURL))
+}
+
+// ProxyHealthCheckURL 返回代理检测目标 URL；空表示沿用内置检测目标。
+func (s *Store) ProxyHealthCheckURL() string {
+	if s == nil {
+		return ""
+	}
+	if v, ok := s.proxyHealthCheckURL.Load().(string); ok {
 		return v
 	}
 	return ""

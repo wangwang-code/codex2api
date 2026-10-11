@@ -114,6 +114,10 @@ type RuntimeSettings struct {
 	GithubToken string
 	// GithubProxyURL GitHub 域名专用出站代理；空表示回落调用方的默认代理（issue #522）。
 	GithubProxyURL string
+	// ProxyHealthCheckURL 代理检测/健康检查的目标 URL；为空时沿用内置检测目标
+	// （ip-api 出口 IP + IPv6 echo）。配置后代理检测会连接这个真实业务地址，
+	// 从而验证"该代理能否真的连上业务上游"，并尽力解析出口 IP 与地区。
+	ProxyHealthCheckURL string
 	// Codex 过载熔断：单账号滑动窗口内 server_is_overloaded 错误占比达到阈值且样本数
 	// 足够时，自动暂停该账号调度一段时间（默认关闭）。
 	CodexOverloadPauseEnabled     bool
@@ -396,6 +400,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSStatelessSlots = settings.CodexWSStatelessSlots
 		next.GithubToken = strings.TrimSpace(settings.GithubToken)
 		next.GithubProxyURL = strings.TrimSpace(settings.GithubProxyURL)
+		next.ProxyHealthCheckURL = strings.TrimSpace(settings.ProxyHealthCheckURL)
 		next.CodexOverloadPauseEnabled = settings.CodexOverloadPauseEnabled
 		next.CodexOverloadThresholdPercent = settings.CodexOverloadThresholdPercent
 		next.CodexOverloadPauseMinutes = settings.CodexOverloadPauseMinutes

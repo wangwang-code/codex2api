@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/security"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -249,7 +249,7 @@ func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 		transport.TLSClientConfig = &tls.Config{}
 	}
 	transport.TLSClientConfig.ClientSessionCache = codexTLSSessionCache
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	baseDialer := security.NewDialer(10*time.Second, 30*time.Second)
 	transport.DialContext = baseDialer.DialContext
 	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
 		log.Printf("[CodexTransport] 代理配置失败，回退直连: proxy=%s err=%v", proxyURL, err)

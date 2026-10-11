@@ -84,6 +84,7 @@ Codex2API 采用三层配置架构：
 |------|------|--------|------|
 | `CODEX_UPSTREAM_TRANSPORT` | 否 | `http` | Codex 上游协议：`http` / `auto` / `ws`。HTTP 入站在 `auto` 下仍走 HTTP 上游 |
 | `CODEX_PROXY_URL` | 否 | - | 全局代理 URL，适用于需要为所有 Codex 上游请求统一配置代理的场景 |
+| `CODEX_HOSTS_OVERRIDE` | 否 | - | 全局强制 hosts 覆盖：把出站拨号里的域名强制成显式 IP，绕开远端（代理侧）错误解析。写法 `host=ip` 或 `host ip`，多条用换行/逗号/分号分隔，支持 `#` 注释；非法条目启动即失败。只改写拨号地址，不影响 TLS SNI / Host |
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
@@ -399,6 +400,11 @@ Codex 瞬时账号限流按 `15s → 30s → 60s → 120s → 240s → 300s` 退
 | `ProxyPoolEnabled` | bool | false | 启用代理池。开启后未绑定账号从启用代理中粘性分配；绑定到已禁用/测挂托管代理的账号不会直连；池空且无全局代理时拒绝调度 |
 | `ResinURL` | string | "" | Resin 粘性代理池地址（含 token，形如 `http://127.0.0.1:2260/<token>`）。日志与设置接口只回显打码后的 `scheme://host` |
 | `ResinPlatformName` | string | "" | Resin 侧平台标识。与 `ResinURL` 同时填写才启用，清空任一即禁用 |
+| `ProxyHealthCheckURL` | string | "" | 代理检测（代理页「测试」/「测试全部」）的目标 URL，仅支持 http/https。留空沿用内置检测目标（ip-api 出口 IP + IPv6 echo）；配置后改为连接这个真实业务地址，测的就是"该代理能不能真的连上业务上游"，并尽力从响应里解析出口 IP（支持 `cdn-cgi/trace` 的 `ip=` 行、纯文本 IP、JSON 的 `ip`/`query`）。返回非 2xx 一律判定该代理不可用。保存后热生效，无需重启。建议填 `https://auth.openai.com/cdn-cgi/trace` |
+
+#### 代理检测目标（ProxyHealthCheckURL）
+
+代理检测默认走内置目标（`ip-api.com` 拿出口 IP + 地区，失败再退到 IPv6 echo），只能证明"代理能上公网"，不能证明"代理能连上业务上游"。填写该字段后，检测改为直连配置的地址：拿到 2xx 才算通过，随后用解析出的出口 IP 补做一次地区查询（查询本身直连，不经过代理）。因此它适合填业务真实上游，例如 `https://auth.openai.com/cdn-cgi/trace`——Cloudflare 的 trace 响应体里带 `ip=`（出口 IP）与 `loc=`，既是真实业务域名，又能顺带拿到出口 IP。
 
 #### 出口链路优先级
 

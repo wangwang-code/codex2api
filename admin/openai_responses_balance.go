@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -222,7 +222,7 @@ func queryOpenAIResponsesBalance(
 
 func newOpenAIResponsesBalanceClient(proxyURL string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := security.NewDialer(10*time.Second, 30*time.Second)
 	transport.DialContext = dialer.DialContext
 	if err := auth.ConfigureTransportProxy(transport, proxyURL, dialer); err != nil {
 		return nil, fmt.Errorf("代理URL无效: %w", err)

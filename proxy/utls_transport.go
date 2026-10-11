@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -99,13 +98,13 @@ var utlsSessionCache = utls.NewLRUClientSessionCache(256)
 // NewUTLSTransport 创建使用 Chrome TLS 指纹的 RoundTripper
 // 支持 HTTP(S) 和 SOCKS5 代理
 func NewUTLSTransport(proxyURL string) http.RoundTripper {
-	var dialer xproxy.Dialer = xproxy.Direct
+	var dialer xproxy.Dialer = security.NewDialer(0, 0)
 
 	if proxyURL != "" {
 		d, err := buildProxyDialer(proxyURL)
 		if err != nil {
 			log.Printf("[UTLS] 代理配置失败，回退直连: proxy=%s err=%v", proxyURL, err)
-			dialer = xproxy.Direct
+			dialer = security.NewDialer(0, 0)
 		} else {
 			dialer = d
 		}
@@ -132,10 +131,22 @@ func buildProxyDialer(proxyURL string) (xproxy.Dialer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析代理 URL 失败: %w", err)
 	}
+	return buildProxyTunnelDialer(u)
+}
 
+// buildProxyTunnelDialer 依据已解析的代理 URL 构造拨号器。
+//
+// 拨号经过的「目标地址」与「代理端点地址」都会经过全局强制 hosts 覆盖
+// (security.RewriteHostPort) 改写：
+//   - http/https：CONNECT 的目标用显式 IP，代理解析目标域名的环节消失；
+//   - socks5/socks5h：SOCKS5 请求里下发 IP（ATYP=IPv4/IPv6），绕开代理侧远端解析；
+//   - 代理端点自身的域名同样被强制成 IP。
+//
+// TLS SNI / Host 头不受影响，仍按原域名握手。
+func buildProxyTunnelDialer(u *url.URL) (xproxy.Dialer, error) {
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
-		return buildHTTPProxyDialer(u)
+		return buildHTTPProxyDialer(u), nil
 	case "socks5", "socks5h":
 		return buildSOCKS5Dialer(u)
 	default:
@@ -143,65 +154,12 @@ func buildProxyDialer(proxyURL string) (xproxy.Dialer, error) {
 	}
 }
 
-// httpConnectDialer 通过 HTTP CONNECT 方法建立隧道的拨号器
-type httpConnectDialer struct {
-	proxyAddr  string // 代理服务器地址（host:port）
-	authHeader string // Proxy-Authorization 头（可选）
-}
-
-// Dial 通过 HTTP CONNECT 隧道连接到目标地址
-func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	// 1. 建立到代理服务器的 TCP 连接
-	conn, err := net.DialTimeout("tcp", d.proxyAddr, 10*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("连接代理服务器失败: %w", err)
-	}
-
-	// 2. 发送 CONNECT 请求建立隧道
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
-	if d.authHeader != "" {
-		connectReq += fmt.Sprintf("Proxy-Authorization: %s\r\n", d.authHeader)
-	}
-	connectReq += "\r\n"
-
-	if _, err := conn.Write([]byte(connectReq)); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("发送 CONNECT 请求失败: %w", err)
-	}
-
-	// 3. 读取代理响应
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("读取代理响应失败: %w", err)
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		conn.Close()
-		return nil, fmt.Errorf("代理 CONNECT 失败 (status %d)", resp.StatusCode)
-	}
-
-	// bufio.Reader 可能缓冲了响应之后的字节，需要包装确保后续读取不丢失
-	if br.Buffered() > 0 {
-		return &bufferedConn{Conn: conn, reader: br}, nil
-	}
-	return conn, nil
-}
-
-// bufferedConn 包装 net.Conn，优先读取 bufio.Reader 中的缓冲数据
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
-}
-
-// buildHTTPProxyDialer 创建 HTTP CONNECT 代理拨号器
-func buildHTTPProxyDialer(u *url.URL) (xproxy.Dialer, error) {
+// buildHTTPProxyDialer 创建 HTTP CONNECT 代理拨号器。
+//
+// 复用 security.CONNECTTunnelDialer：它在拨代理端点、以及下发 CONNECT 目标时
+// 都会经过强制 hosts 覆盖改写。https:// 代理沿用既有行为（明文连接代理端点），
+// 本次只新增地址覆盖改写。
+func buildHTTPProxyDialer(u *url.URL) *security.CONNECTTunnelDialer {
 	addr := u.Host
 	if !strings.Contains(addr, ":") {
 		if u.Scheme == "https" {
@@ -211,20 +169,27 @@ func buildHTTPProxyDialer(u *url.URL) (xproxy.Dialer, error) {
 		}
 	}
 
-	d := &httpConnectDialer{proxyAddr: addr}
+	d := &security.CONNECTTunnelDialer{
+		ProxyAddr: addr,
+		Base:      security.NewDialer(10*time.Second, 30*time.Second),
+	}
 
 	// 处理代理认证
 	if u.User != nil {
 		username := u.User.Username()
 		password, _ := u.User.Password()
 		credentials := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-		d.authHeader = "Basic " + credentials
+		d.AuthHeader = "Basic " + credentials
 	}
 
-	return d, nil
+	return d
 }
 
-// buildSOCKS5Dialer 创建 SOCKS5 代理拨号器
+// buildSOCKS5Dialer 创建 SOCKS5 代理拨号器。
+//
+// forward 用覆盖感知拨号器（代理端点域名→IP）；返回的 dialer 再包一层
+// TargetRewriteDialer，让 SOCKS5 请求里的目标也用 IP 下发，从而绕开代理侧的
+// 远端 DNS 解析（socks5h 语义被强制成本地显式 IP）。
 func buildSOCKS5Dialer(u *url.URL) (xproxy.Dialer, error) {
 	var auth *xproxy.Auth
 	if u.User != nil {
@@ -235,7 +200,29 @@ func buildSOCKS5Dialer(u *url.URL) (xproxy.Dialer, error) {
 		}
 	}
 
-	return xproxy.SOCKS5("tcp", u.Host, auth, xproxy.Direct)
+	dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, security.NewDialer(0, 0))
+	if err != nil {
+		return nil, err
+	}
+	return security.TargetRewriteDialer{Inner: socksForwardDialer{d: dialer}}, nil
+}
+
+// socksForwardDialer 把 x/net/proxy 的 Dialer 适配成 security.Dialer。
+type socksForwardDialer struct {
+	d xproxy.Dialer
+}
+
+func (s socksForwardDialer) Dial(network, address string) (net.Conn, error) {
+	return s.d.Dial(network, address)
+}
+
+func (s socksForwardDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if cd, ok := s.d.(interface {
+		DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	}); ok {
+		return cd.DialContext(ctx, network, address)
+	}
+	return s.d.Dial(network, address)
 }
 
 // getOrCreateConnection 获取或创建 HTTP/2 连接

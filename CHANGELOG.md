@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Configurable proxy health-check target (`proxy_health_check_url`).** "Test" and "Test all" on the proxies page previously always probed `ip-api.com`, which only proves the proxy can reach the public internet, not that it can reach the upstream this gateway actually needs. A new optional system setting (Settings → Runtime → Proxy Health Check, wired through the admin API, SQLite/PostgreSQL persistence and hot-applied to the runtime snapshot) points the probe at a real business address — `https://auth.openai.com/cdn-cgi/trace` is the suggested value. When set, the probe must get a 2xx from that target; any non-2xx is a conclusive failure ("the proxy cannot reach the upstream"), and a 407 is still reported as proxy auth failure. The exit IP is extracted on a best-effort basis from `cdn-cgi/trace`'s `ip=` line, a plain-text IP body or JSON `ip`/`query`, and is then used for the existing region lookup (which stays direct, not proxied). Leaving the field empty keeps the previous behaviour exactly, including the IPv6 echo fallback; an invalid value (non-http/https, missing host, too long) is rejected by the API instead of being silently stored as empty.
+
+- **Global forced hosts override for all outbound dialing (`CODEX_HOSTS_OVERRIDE`).** Some proxy setups resolve names on the wrong side of the tunnel — most visibly `socks5h://`, where the proxy performs the DNS lookup — and a wrong remote answer cannot be corrected locally. The new `CODEX_HOSTS_OVERRIDE` environment variable installs a process-wide `hostname -> IP` map that is applied at the dial layer: the proxy endpoint itself (`proxy.example.com:1080` becomes an explicit IP), the target handed to the proxy (the `CONNECT` authority and the SOCKS5 `ATYP` address are rewritten to an IP, so the proxy never resolves a name — `socks5h` is forced into local explicit-IP resolution), and direct connections. Only the dialed address is rewritten; TLS SNI and the `Host` header keep the original name, so certificate validation and virtual-host routing are unchanged. Entries accept `host=ip` or hosts-file style `host ip`, separated by newlines, commas or semicolons, with `#` comments; names not listed keep resolving normally, and a malformed entry fails startup. The HTTP(S) proxy path switches to a self-built `CONNECT` tunnel when the override is active, because `net/http` has no hook to rewrite the `CONNECT` target. Off by default: with the variable unset, every dial path is byte-identical to before.
+
 ## v3.0.0 - 2026-09-22
 
 ### Features

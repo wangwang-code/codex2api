@@ -17,6 +17,8 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -27,6 +29,8 @@ const (
 	proxyBatchTestMaxBody     = 64 << 10
 	proxyProbeMaxBody         = 1 << 20
 	proxyProbeIPAPIFields     = "status,message,country,regionName,city,isp,query"
+	// proxyHealthCheckURLMaxLen 限制可配置的检测目标长度（防止异常长 URL 进入日志/DB）。
+	proxyHealthCheckURLMaxLen = 500
 )
 
 var (
@@ -34,6 +38,11 @@ var (
 	proxyProbeIPv6EchoURLsFn = defaultProxyProbeIPv6EchoURLs
 	proxyProbeLookupGeoFn    = lookupProxyExitGeo
 	proxyProbeGeoHTTPClient  = &http.Client{Timeout: 5 * time.Second}
+	// proxyProbeHealthCheckURLFn 返回管理员配置的代理检测目标 URL；空表示沿用内置检测目标。
+	// 收敛到 runtime settings（数据库系统设置），保存后热生效，无需重启。
+	proxyProbeHealthCheckURLFn = func() string {
+		return strings.TrimSpace(proxy.CurrentRuntimeSettings().ProxyHealthCheckURL)
+	}
 )
 
 type proxyProbeResult struct {
@@ -96,7 +105,7 @@ func probeProxyWithTimeout(
 	}
 	transport := &http.Transport{DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	baseDialer := security.NewDialer(10*time.Second, 30*time.Second)
 	transport.DialContext = baseDialer.DialContext
 	var connectedToProxyEndpoint atomic.Bool
 	var startedSOCKSTargetConnect atomic.Bool
@@ -133,6 +142,21 @@ func probeProxyWithTimeout(
 			GotTransportConnection:    gotTransportConnection.Load(),
 		}
 	}
+
+	// 管理员配置了检测目标时，直接连这个真实业务地址：测的就是"该代理能不能真的
+	// 连上业务上游"，不再依赖 ip-api 这类第三方探测点。
+	if healthCheckURL := proxyProbeHealthCheckURLFn(); healthCheckURL != "" {
+		return runProxyHealthCheckProbe(
+			ctx,
+			client,
+			&gotTransportConnection,
+			proxyScheme,
+			connectionState,
+			healthCheckURL,
+			lang,
+		)
+	}
+
 	primary := doProxyProbeRequest(
 		ctx,
 		client,
@@ -141,6 +165,7 @@ func probeProxyWithTimeout(
 		connectionState,
 		proxyProbeIPv4URLFn(lang),
 		parseIPAPIProbeBody,
+		proxyProbeRequestOptions{},
 	)
 	if primary.Success || ctx.Err() != nil || !shouldFallbackToIPv6Probe(primary) {
 		return primary
@@ -159,6 +184,7 @@ func probeProxyWithTimeout(
 			connectionState,
 			echoURL,
 			parseProxyProbeEchoBody,
+			proxyProbeRequestOptions{},
 		)
 		if ipv6Result.Success {
 			break
@@ -195,6 +221,90 @@ func defaultProxyProbeIPv6EchoURLs() []string {
 	}
 }
 
+// normalizeProxyHealthCheckURL 校验并归一化代理检测目标 URL。
+// 空字符串表示关闭该功能（沿用内置检测目标），不报错。
+func normalizeProxyHealthCheckURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > proxyHealthCheckURLMaxLen {
+		return "", fmt.Errorf("代理检测 URL 过长（最多 %d 字符）", proxyHealthCheckURLMaxLen)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("代理检测 URL 非法: %v", err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("代理检测 URL 仅支持 http/https，当前是 %q", parsed.Scheme)
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return "", fmt.Errorf("代理检测 URL 缺少主机名")
+	}
+	return parsed.String(), nil
+}
+
+// runProxyHealthCheckProbe 用管理员配置的业务目标做一次真实探测：
+// 代理能连上并拿到 2xx 才算通过，随后尽力补上出口 IP 与地区信息。
+func runProxyHealthCheckProbe(
+	ctx context.Context,
+	client *http.Client,
+	gotTransportConnection *atomic.Bool,
+	proxyScheme string,
+	connectionState func() proxyProbeConnectionState,
+	probeURL string,
+	lang string,
+) proxyProbeResult {
+	result := doProxyProbeRequest(
+		ctx,
+		client,
+		gotTransportConnection,
+		proxyScheme,
+		connectionState,
+		probeURL,
+		parseProxyProbeHealthCheckBody,
+		proxyProbeRequestOptions{
+			// 业务目标返回非 2xx（例如被 WAF 拒绝）说明这个代理用不了，属于确定失败。
+			conclusiveStatus: true,
+			unavailableMessage: func(status int) string {
+				return fmt.Sprintf("检测目标返回 HTTP %d（该代理无法正常访问业务上游）", status)
+			},
+		},
+	)
+	if !result.Success || result.IP == "" {
+		return result
+	}
+	country, region, city, isp := proxyProbeLookupGeoFn(ctx, result.IP, lang)
+	result.Country = country
+	result.Region = region
+	result.City = city
+	result.ISP = isp
+	result.Location = joinProxyProbeLocation(country, region, city)
+	return result
+}
+
+// parseProxyProbeHealthCheckBody 解析业务目标的响应：2xx 本身即"代理可用"，
+// 出口 IP 尽力而为——支持 cdn-cgi/trace 的 `ip=` 行、纯文本 IP、JSON 的 ip/query。
+// 取不到 IP 不算失败，只是没有地理位置信息。
+func parseProxyProbeHealthCheckBody(body []byte, latencyMs int) proxyProbeResult {
+	result := proxyProbeResult{Success: true, Conclusive: true, LatencyMs: latencyMs}
+	if ip, err := parseProxyProbeExitIP(body); err == nil {
+		result.IP = ip
+	}
+	return result
+}
+
+// proxyProbeRequestOptions 微调单次探测请求的语义。
+type proxyProbeRequestOptions struct {
+	// conclusiveStatus 为 true 时，非 2xx 状态码视为"确定失败"（业务目标不可用），
+	// 而不是"探测服务暂时不可用"这种不可判定的软失败。
+	conclusiveStatus bool
+	// unavailableMessage 定制非 2xx 的报错文案，nil 时沿用内置探测服务的文案。
+	unavailableMessage func(status int) string
+}
+
 func doProxyProbeRequest(
 	ctx context.Context,
 	client *http.Client,
@@ -203,6 +313,7 @@ func doProxyProbeRequest(
 	connectionState func() proxyProbeConnectionState,
 	probeURL string,
 	parseBody func([]byte, int) proxyProbeResult,
+	opts proxyProbeRequestOptions,
 ) proxyProbeResult {
 	gotTransportConnection.Store(false)
 	trace := &httptrace.ClientTrace{
@@ -240,9 +351,14 @@ func doProxyProbeRequest(
 		}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		message := fmt.Sprintf("代理检测服务暂时不可用 (HTTP %d)", resp.StatusCode)
+		if opts.unavailableMessage != nil {
+			message = opts.unavailableMessage(resp.StatusCode)
+		}
 		return proxyProbeResult{
-			LatencyMs: latencyMs,
-			Error:     fmt.Sprintf("代理检测服务暂时不可用 (HTTP %d)", resp.StatusCode),
+			Conclusive: opts.conclusiveStatus,
+			LatencyMs:  latencyMs,
+			Error:      message,
 		}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, proxyProbeMaxBody+1))

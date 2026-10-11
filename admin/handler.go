@@ -17,7 +17,6 @@ import (
 	"math"
 	"mime"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -4673,7 +4672,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	baseDialer := security.NewDialer(10*time.Second, 30*time.Second)
 	transport.DialContext = baseDialer.DialContext
 	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
 		return nil, fmt.Errorf("代理URL无效: %w", err)
@@ -9357,6 +9356,7 @@ type settingsResponse struct {
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
 	GithubProxyURL                      string `json:"github_proxy_url"`
+	ProxyHealthCheckURL                 string `json:"proxy_health_check_url"`
 	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
 	CodexOverloadThresholdPercent       int    `json:"codex_overload_threshold_percent"`
 	CodexOverloadPauseMinutes           int    `json:"codex_overload_pause_minutes"`
@@ -9545,6 +9545,7 @@ type updateSettingsReq struct {
 	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
 	GithubToken                         *string                          `json:"github_token"`
 	GithubProxyURL                      *string                          `json:"github_proxy_url"`
+	ProxyHealthCheckURL                 *string                          `json:"proxy_health_check_url"`
 	CodexOverloadPauseEnabled           *bool                            `json:"codex_overload_pause_enabled"`
 	CodexOverloadThresholdPercent       *int                             `json:"codex_overload_threshold_percent"`
 	CodexOverloadPauseMinutes           *int                             `json:"codex_overload_pause_minutes"`
@@ -10377,6 +10378,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
+		ProxyHealthCheckURL:                 h.store.ProxyHealthCheckURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
 		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
 		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
@@ -11194,6 +11196,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.GithubProxyURL = v
 		log.Printf("设置已更新: github_proxy_url = %s", v)
 	}
+	if req.ProxyHealthCheckURL != nil {
+		// 代理检测目标会直接作为请求 URL 使用，含空白/非法 scheme/无 host 的一律拒绝，
+		// 而不是静默存成空——那样用户会以为设置生效了。
+		raw := strings.TrimSpace(*req.ProxyHealthCheckURL)
+		normalized, normalizeErr := normalizeProxyHealthCheckURL(raw)
+		if normalizeErr != nil {
+			writeError(c, http.StatusBadRequest, normalizeErr.Error())
+			return
+		}
+		h.store.SetProxyHealthCheckURL(normalized)
+		runtimeCfg.ProxyHealthCheckURL = normalized
+		log.Printf("设置已更新: proxy_health_check_url = %s", normalized)
+	}
 
 	// Codex 过载熔断（配置只存 RuntimeSettings，热更新生效）
 	if req.CodexOverloadPauseEnabled != nil {
@@ -11919,6 +11934,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
 		GithubToken:                         h.store.GithubToken(),
 		GithubProxyURL:                      h.store.GithubProxyURL(),
+		ProxyHealthCheckURL:                 h.store.ProxyHealthCheckURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
 		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
 		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,
@@ -12257,6 +12273,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
+		ProxyHealthCheckURL:                 h.store.ProxyHealthCheckURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
 		CodexOverloadThresholdPercent:       runtimeCfg.CodexOverloadThresholdPercent,
 		CodexOverloadPauseMinutes:           runtimeCfg.CodexOverloadPauseMinutes,

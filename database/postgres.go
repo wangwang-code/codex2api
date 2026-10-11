@@ -1500,6 +1500,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_stateless_slots INT DEFAULT 8;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS github_token TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS github_proxy_url TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_health_check_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_pause_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_threshold_percent INT DEFAULT 20;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_pause_minutes INT DEFAULT 30;
@@ -2442,6 +2443,11 @@ type SystemSettings struct {
 	// GithubProxyURL GitHub 域名（github.com / api.github.com / *.githubusercontent.com）
 	// 专用出站代理；空表示回落全局代理/环境代理（issue #522）。
 	GithubProxyURL string
+	// ProxyHealthCheckURL 代理检测/健康检查的目标 URL。为空时沿用内置检测目标
+	// （ip-api 出口 IP + IPv6 echo）；配置后代理检测改为连接这个真实业务地址
+	// （例如 https://auth.openai.com/cdn-cgi/trace），测的就是"该代理能不能真的
+	// 连上业务上游"，并尽力从响应里解析出口 IP 与地区。
+	ProxyHealthCheckURL string
 	// Codex 过载熔断：单账号滑动窗口内 server_is_overloaded 占比达到阈值时
 	// 自动暂停调度一段时间（默认关闭）。
 	CodexOverloadPauseEnabled           bool
@@ -2698,6 +2704,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_ws_stateless_slots, 8),
 		       COALESCE(github_token, ''),
 		       COALESCE(github_proxy_url, ''),
+		       COALESCE(proxy_health_check_url, ''),
 		       COALESCE(codex_overload_pause_enabled, false),
 		       COALESCE(codex_overload_threshold_percent, 20),
 		       COALESCE(codex_overload_pause_minutes, 30),
@@ -2784,6 +2791,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSStatelessSlots,
 		&s.GithubToken,
 		&s.GithubProxyURL,
+		&s.ProxyHealthCheckURL,
 		&s.CodexOverloadPauseEnabled,
 		&s.CodexOverloadThresholdPercent,
 		&s.CodexOverloadPauseMinutes,
@@ -3038,6 +3046,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_stateless_slots,
 					github_token,
 					github_proxy_url,
+					proxy_health_check_url,
 					codex_overload_pause_enabled,
 					codex_overload_threshold_percent,
 					codex_overload_pause_minutes,
@@ -3054,7 +3063,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_oauth_keepalive_enabled,
 					codex_telemetry_timing_debug
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125, $126)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -3094,10 +3103,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $126 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $127 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $127 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $128 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -3165,6 +3174,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_stateless_slots = EXCLUDED.codex_ws_stateless_slots,
 					github_token = EXCLUDED.github_token,
 					github_proxy_url = EXCLUDED.github_proxy_url,
+					proxy_health_check_url = EXCLUDED.proxy_health_check_url,
 					codex_overload_pause_enabled = EXCLUDED.codex_overload_pause_enabled,
 					codex_overload_threshold_percent = EXCLUDED.codex_overload_threshold_percent,
 					codex_overload_pause_minutes = EXCLUDED.codex_overload_pause_minutes,
@@ -3218,6 +3228,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexWSStatelessSlots(s.CodexWSStatelessSlots),
 		strings.TrimSpace(s.GithubToken),
 		strings.TrimSpace(s.GithubProxyURL),
+		strings.TrimSpace(s.ProxyHealthCheckURL),
 		s.CodexOverloadPauseEnabled,
 		NormalizeCodexOverloadThresholdPercent(s.CodexOverloadThresholdPercent),
 		NormalizeCodexOverloadPauseMinutes(s.CodexOverloadPauseMinutes),

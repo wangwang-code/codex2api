@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+
+	"github.com/codex2api/security"
 )
 
 // schemaNameRegex 限定 PostgreSQL schema 名为 ASCII 标识符，避免 DSN/DDL 注入。
@@ -105,6 +107,7 @@ type Config struct {
 	UseWebsocket              bool     // 是否启用 WebSocket 传输
 	CodexUpstreamTransport    string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
 	TrustedProxies            []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
+	HostsOverride             string   // 全局强制 hosts 覆盖原始值（CODEX_HOSTS_OVERRIDE），空表示关闭
 }
 
 // applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
@@ -187,6 +190,18 @@ func Load(envPath string) (*Config, error) {
 		}
 	}
 	cfg.TrustedProxies = parseTrustedProxiesEnv(os.Getenv("CODEX_TRUSTED_PROXIES"))
+
+	// 全局强制 hosts 覆盖：把所有出站拨号里的域名强制成显式 IP，用于绕开某些
+	// 远端（代理侧 / 链路内）错误的域名解析。解析失败即 fail-fast，避免带着
+	// 半生效的覆盖运行。
+	cfg.HostsOverride = strings.TrimSpace(os.Getenv(security.EnvHostsOverride))
+	if err := security.SetHostsOverride(cfg.HostsOverride); err != nil {
+		return nil, fmt.Errorf("非法的 %s: %w", security.EnvHostsOverride, err)
+	}
+	if security.HostsOverrideEnabled() {
+		log.Printf("已启用强制 hosts 覆盖: %d 条 (%s)", security.CurrentHostsOverride().Len(), security.EnvHostsOverride)
+	}
+
 	for _, setting := range []struct {
 		name   string
 		target *int
