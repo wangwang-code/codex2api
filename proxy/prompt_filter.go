@@ -17,6 +17,9 @@ const (
 	upstreamCyberPolicyUserMessage       = "此内容因可能存在网络安全风险而被标记，本次已记录。请重新表述请求；再次触发可能会停用账号。如果确认是误判，请联系管理员。"
 	upstreamCyberPolicyLockedUserMessage = "此内容因可能存在网络安全风险而被标记，本次已记录并锁定当前对话。请新建对话后继续；再次触发可能会停用账号。如果确认是误判，请联系管理员解锁。"
 	defaultLocalPromptBlockMessage       = "Request contains content blocked by prompt filter"
+	// promptBlockedReasonPrefix 标在被拒文案前面，让调用方一眼看出这是「请求内容
+	// 被拒」而不是上游故障；后面接审核模型给出的具体原因。
+	promptBlockedReasonPrefix = "[翻译被拒]"
 )
 
 func localPromptBlockMessage(cfg promptfilter.Config) string {
@@ -24,6 +27,21 @@ func localPromptBlockMessage(cfg promptfilter.Config) string {
 		return message
 	}
 	return defaultLocalPromptBlockMessage
+}
+
+// promptBlockedMessage 组装 400 prompt_blocked 的用户可见文案。
+//
+// 本地规则只能说明「命中了什么」，说不清「为什么」——那句话对用户毫无帮助，
+// 翻译场景下用户只会反复重试同一段文字。审核模型（review）在 flag 时会给出
+// reason，这里原样带上（不截断，截断会把中文截成半句话），并加固定前缀；
+// 没有 reason 时退回配置文案/默认文案。
+func promptBlockedMessage(cfg promptfilter.Config, verdict promptfilter.Verdict) string {
+	if verdict.ReviewFlagged {
+		if reason := strings.TrimSpace(verdict.ReviewReason); reason != "" {
+			return promptBlockedReasonPrefix + reason
+		}
+	}
+	return localPromptBlockMessage(cfg)
 }
 
 // promptFilterFullTextMaxRunes limits the persisted redacted blocked-request text preview.
@@ -99,7 +117,7 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
-		localPromptBlockMessage(cfg),
+		promptBlockedMessage(cfg, verdict),
 		api.ErrorTypeInvalidRequest,
 	), http.StatusBadRequest)
 	return true
@@ -134,7 +152,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
-		localPromptBlockMessage(cfg),
+		promptBlockedMessage(cfg, verdict),
 		api.ErrorTypeInvalidRequest,
 	), http.StatusBadRequest)
 	return true

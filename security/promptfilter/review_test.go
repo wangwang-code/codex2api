@@ -978,3 +978,13 @@ func TestReviewTextRoundRobinsAcrossKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewReasonTextKeepsFullReason(t *testing.T) {
+	long := strings.Repeat("该请求包含对真实人物的暴力威胁描写", 20)
+	if got := reviewReasonText("  " + long + "\n"); got != long {
+		t.Fatalf("reason = %q (len %d), want untruncated %d runes", got, len([]rune(got)), len([]rune(long)))
+	}
+	if got := reviewReasonText("涉及未成年人的性暗示内容"); got != "涉及未成年人的性暗示内容" {
+		t.Fatalf("reason = %q", got)
+	}
+}

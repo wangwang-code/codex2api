@@ -949,7 +949,7 @@ func ApplyReviewOutcome(verdict Verdict, outcome ReviewOutcome, reviewErr error,
 	if reason == "" {
 		verdict.Reason = "prompt review flagged request"
 	} else {
-		verdict.Reason = "prompt review flagged request: " + truncateReviewReason(reason)
+		verdict.Reason = "prompt review flagged request: " + reviewReasonText(reason)
 	}
 	return verdict
 }
@@ -1338,7 +1338,7 @@ func decodeChatReviewResponse(body []byte, cfg ReviewConfig) (ReviewOutcome, err
 	return ReviewOutcome{
 		Flagged:    confidence >= cfg.Adapter.ConfidenceThreshold,
 		Confidence: confidence,
-		Reason:     truncateReviewReason(decision.Reason),
+		Reason:     reviewReasonText(decision.Reason),
 		Model:      model,
 	}, nil
 }
@@ -1409,11 +1409,11 @@ func truncateReviewText(text string, maxRunes int) string {
 	return string(runes[:maxRunes])
 }
 
-func truncateReviewReason(reason string) string {
-	reason = strings.TrimSpace(reason)
-	if utf8.RuneCountInString(reason) <= 20 {
-		return reason
-	}
-	runes := []rune(reason)
-	return string(runes[:20])
+// reviewReasonText 返回审核理由原文，只做首尾空白清理。
+//
+// 这里曾经裁到 20 个字符：中文常常被截在半句上（「该请求包含对真实人物的暴力
+// 威胁描」），而这条理由现在会原样出现在客户端提示里（"[翻译被拒]<reason>"），
+// 截断等于把「为什么被拒」说成半句话。长度由审核模型的输出自己约束。
+func reviewReasonText(reason string) string {
+	return strings.TrimSpace(reason)
 }

@@ -407,3 +407,55 @@ func TestPromptFilterEmptyLocalBlockMessageKeepsDefault(t *testing.T) {
 		t.Fatalf("message = %q", got)
 	}
 }
+
+func TestPromptBlockedMessageUsesReviewReason(t *testing.T) {
+	cfg := promptfilter.DefaultConfig()
+	cfg.Advanced.Enforcement.LocalBlockMessage = ""
+
+	cases := []struct {
+		name    string
+		verdict promptfilter.Verdict
+		want    string
+	}{
+		{
+			name:    "review flagged with reason",
+			verdict: promptfilter.Verdict{Action: promptfilter.ActionBlock, Reviewed: true, ReviewFlagged: true, ReviewReason: "涉及未成年人不当内容"},
+			want:    "[翻译被拒]涉及未成年人不当内容",
+		},
+		{
+			name:    "review flagged without reason falls back",
+			verdict: promptfilter.Verdict{Action: promptfilter.ActionBlock, Reviewed: true, ReviewFlagged: true},
+			want:    defaultLocalPromptBlockMessage,
+		},
+		{
+			name:    "review passed but local rule blocked keeps default",
+			verdict: promptfilter.Verdict{Action: promptfilter.ActionBlock, Reviewed: true, ReviewFlagged: false, ReviewReason: "看起来没问题"},
+			want:    defaultLocalPromptBlockMessage,
+		},
+		{
+			name:    "no review at all keeps default",
+			verdict: promptfilter.Verdict{Action: promptfilter.ActionBlock},
+			want:    defaultLocalPromptBlockMessage,
+		},
+		{
+			name:    "long reason is not truncated",
+			verdict: promptfilter.Verdict{Action: promptfilter.ActionBlock, Reviewed: true, ReviewFlagged: true, ReviewReason: strings.Repeat("拒", 300)},
+			want:    promptBlockedReasonPrefix + strings.Repeat("拒", 300),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := promptBlockedMessage(cfg, tc.verdict); got != tc.want {
+				t.Fatalf("message = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPromptBlockedMessageHonoursConfiguredLocalMessage(t *testing.T) {
+	cfg := promptfilter.DefaultConfig()
+	cfg.Advanced.Enforcement.LocalBlockMessage = "自定义拦截文案"
+	if got := promptBlockedMessage(cfg, promptfilter.Verdict{Action: promptfilter.ActionBlock}); got != "自定义拦截文案" {
+		t.Fatalf("message = %q", got)
+	}
+}
