@@ -103,7 +103,7 @@ func NewUTLSTransport(proxyURL string) http.RoundTripper {
 	if proxyURL != "" {
 		d, err := buildProxyDialer(proxyURL)
 		if err != nil {
-			log.Printf("[UTLS] 代理配置失败，回退直连: proxy=%s err=%v", proxyURL, err)
+			log.Printf("[UTLS] 代理配置失败，回退直连: proxy=%s err_type=%T", security.MaskURLCredentials(proxyURL), err)
 			dialer = security.NewDialer(0, 0)
 		} else {
 			dialer = d
@@ -157,8 +157,8 @@ func buildProxyTunnelDialer(u *url.URL) (xproxy.Dialer, error) {
 // buildHTTPProxyDialer 创建 HTTP CONNECT 代理拨号器。
 //
 // 复用 security.CONNECTTunnelDialer：它在拨代理端点、以及下发 CONNECT 目标时
-// 都会经过强制 hosts 覆盖改写。https:// 代理沿用既有行为（明文连接代理端点），
-// 本次只新增地址覆盖改写。
+// 都会经过强制 hosts 覆盖改写；https:// 代理同样先与代理完成 TLS 握手，
+// 避免 Proxy-Authorization 明文过网。
 func buildHTTPProxyDialer(u *url.URL) *security.CONNECTTunnelDialer {
 	addr := u.Host
 	if !strings.Contains(addr, ":") {
@@ -170,8 +170,10 @@ func buildHTTPProxyDialer(u *url.URL) *security.CONNECTTunnelDialer {
 	}
 
 	d := &security.CONNECTTunnelDialer{
-		ProxyAddr: addr,
-		Base:      security.NewDialer(10*time.Second, 30*time.Second),
+		ProxyAddr:       addr,
+		ProxyTLS:        strings.EqualFold(u.Scheme, "https"),
+		ProxyServerName: u.Hostname(),
+		Base:            security.NewDialer(10*time.Second, 30*time.Second),
 	}
 
 	// 处理代理认证

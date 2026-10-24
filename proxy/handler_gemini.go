@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -165,10 +167,26 @@ func (h *Handler) GeminiModelsAction(c *gin.Context) {
 	}
 }
 
+// geminiCountTokensInboundEndpoint 返回 native countTokens 入口的入站端点标识，
+// 与上游端点（v1internal:countTokens）区分，供日志、错误与用量记录归因使用。
 func geminiCountTokensInboundEndpoint() string {
 	return "/v1beta/models:countTokens"
 }
 
+// geminiNativeSelectionOptions 组装 native Gemini 入口（generateContent /
+// streamGenerateContent / countTokens）的选号上下文。
+//
+// 这两个入口的候选池被 antigravityOAuthChannelAccountFilter 硬限定为 Antigravity OAuth，
+// 因此渠道必须按候选池的真实归属取 antigravity：auto 渠道 Key（requestUpstreamChannel 为
+// 空）走这里时，若沿用请求渠道，auth 侧 isAntigravityProvider("") 为 false，首绑 / Fresh
+// 加权避险会整体失效。
+func geminiNativeSelectionOptions(c *gin.Context, model string, policy auth.DispatchPolicy) auth.SelectionOptions {
+	return selectionOptionsForRequestWithProvider(c, model, policy, database.UpstreamChannelAntigravity)
+}
+
+// handleGeminiCountTokens 处理 native Gemini models:countTokens 请求：先过 Key 限额
+// 与并发额度，候选池被硬限定为 Antigravity OAuth 并叠加跨实例冷却、渠道与预算过滤，
+// 随后在重试循环内带重试排除项与亲和守卫选号，转发到上游 v1internal:countTokens。
 func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody []byte) {
 	if h.enforceAPIKeyLimitsAndReply(c, model) {
 		return
@@ -182,7 +200,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	}
 
 	accountFilter := antigravityOAuthChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), model, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), model, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, model, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -201,6 +219,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	dispatchPolicy := dispatchPolicyForModel(model)
+	selectionOpts := geminiNativeSelectionOptions(c, model, dispatchPolicy)
 	inboundEndpoint := geminiCountTokensInboundEndpoint()
 	upstreamEndpoint := "/v1internal:countTokens"
 
@@ -211,7 +230,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
-			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy,
+			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolOpenAI) {
@@ -267,7 +286,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 			_ = resp.Body.Close()
 			lastStatusCode = resp.StatusCode
 			lastBody = errBody
@@ -287,12 +306,16 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			// countTokens 与 generateContent 打到的是同一个 Cloud Code 配额池：漏掉
+			// 这里就等于 429/503 只被计数、从不写模型冷却，被上游限流的账号会立刻在
+			// 下一次选号中重新入选（wireModel 联动与 family 冷却也一并丢失）。
+			h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, model)
 			log.Printf("Gemini native countTokens upstream error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			if shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) {
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -335,6 +358,85 @@ func geminiInboundEndpoint(stream bool) string {
 	return "/v1beta/models:generateContent"
 }
 
+type geminiNativeStreamResult struct {
+	usage        UsageInfo
+	firstTokenMs int
+	readErr      error
+	writeErr     error
+}
+
+// forwardGeminiNativeStream keeps reads and downstream writes distinguishable
+// for usage logging. Emit complete SSE events and flush each one so a thought
+// does not sit in the HTTP buffer while the upstream prepares its answer.
+func forwardGeminiNativeStream(c *gin.Context, body io.Reader, startedAt time.Time) geminiNativeStreamResult {
+	var result geminiNativeStreamResult
+	var usage geminiNativeUsage
+	activateContinuousRetryKeepalive(c.Request.Context())
+	result.readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), body, func(_ string, data []byte) bool {
+		if c.Request.Context().Err() != nil {
+			return false
+		}
+		usage.observe(data)
+		if result.firstTokenMs == 0 && !startedAt.IsZero() && geminiNativeHasContent(data) {
+			result.firstTokenMs = max(int(time.Since(startedAt).Milliseconds()), 1)
+		}
+		frame := "data: " + string(data) + "\n\n"
+		var written int
+		written, result.writeErr = c.Writer.WriteString(frame)
+		if result.writeErr == nil && written != len(frame) {
+			result.writeErr = io.ErrShortWrite
+		}
+		if result.writeErr != nil {
+			return false
+		}
+		c.Writer.Flush()
+		return true
+	})
+	result.usage = usage.usageInfo()
+	return result
+}
+
+// writeGeminiNativeError uses the same native error envelope before and after
+// SSE headers are committed. Once streaming has started, the HTTP status cannot
+// change. Google SDKs expect a bare JSON error at the end of the stream; an SSE
+// data error is silently discarded by the SDK bundled with Gemini CLI 0.61.0.
+func writeGeminiNativeError(c *gin.Context, status int, message string) {
+	statusName := "INTERNAL"
+	switch status {
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		statusName = "UNAVAILABLE"
+	case http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		statusName = "DEADLINE_EXCEEDED"
+	case http.StatusTooManyRequests:
+		statusName = "RESOURCE_EXHAUSTED"
+	case http.StatusBadRequest:
+		statusName = "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		statusName = "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		statusName = "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		statusName = "NOT_FOUND"
+	}
+	payload := gin.H{"error": gin.H{"code": status, "message": message, "status": statusName}}
+	if !c.Writer.Written() {
+		c.Header("Content-Type", "application/json; charset=utf-8")
+		c.JSON(status, payload)
+		return
+	}
+	if !strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
+		return
+	}
+	data, _ := json.Marshal(payload)
+	if _, err := c.Writer.Write(data); err == nil {
+		c.Writer.Flush()
+	}
+}
+
+// handleGeminiGenerateContent 处理 native Gemini generateContent /
+// streamGenerateContent 请求：候选池被硬限定为 Antigravity OAuth 并叠加跨实例冷却、
+// 渠道与预算过滤，按 stream 决定是否安装 SSE 心跳，并在持续重试策略下带重试排除项
+// 与亲和守卫选号转发上游。
 func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawBody []byte, stream bool) {
 	if h.enforceAPIKeyLimitsAndReply(c, model) {
 		return
@@ -348,16 +450,21 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	}
 
 	accountFilter := antigravityOAuthChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), model, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), model, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, model, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
-	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolResponses)
+	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolGemini)
 	defer stopRetryDeadline()
-	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, stream, "text/event-stream; charset=utf-8")
+	// Gemini CLI's bundled Google SDK expects data events and cannot skip SSE
+	// comments. An empty response keeps the connection alive without content.
+	stopRetryKeepalive := installContinuousRetrySSEKeepaliveWithOptions(c, stream, continuousRetrySSEKeepaliveOptions{
+		contentType: "text/event-stream; charset=utf-8",
+		payload:     "data: {}\n\n",
+	})
 	defer stopRetryKeepalive()
 	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
 		activateContinuousRetryKeepalive(c.Request.Context())
@@ -376,6 +483,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	dispatchPolicy := dispatchPolicyForModel(model)
+	selectionOpts := geminiNativeSelectionOptions(c, model, dispatchPolicy)
 	inboundEndpoint := geminiInboundEndpoint(stream)
 	upstreamEndpoint := antigravityUpstreamEndpoint(stream)
 
@@ -386,13 +494,13 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
-			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy,
+			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
-			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolGemini) {
 				return
 			}
-			if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+			if !claimContinuousRetryTerminal(c, continuousRetryProtocolGemini) {
 				return
 			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -422,15 +530,18 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			}
 		}
 
-		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		// Native Gemini forwards the stream directly and does not drain usage
+		// after a disconnect. Keep this context alive through body consumption,
+		// while letting a canceled client stop a blocked upstream read immediately.
+		upstreamCtx, upstreamCancel := context.WithCancel(c.Request.Context())
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 			return ExecuteAntigravityGeminiRequest(upstreamCtx, account, model, rawBody, stream, proxyURL)
 		})
-		upstreamCancel()
 		durationMs := int(time.Since(start).Milliseconds())
 		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
 
 		if reqErr != nil {
+			upstreamCancel()
 			if apiKeyModelRequestError(reqErr) != nil {
 				h.store.Release(account)
 				sendAPIKeyModelRequestQuotaError(c, reqErr)
@@ -443,7 +554,9 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			if !retryable || !shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy) {
-				ErrorToGinResponse(c, reqErr)
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolGemini) && c.Request.Context().Err() == nil {
+					writeGeminiNativeError(c, StatusCodeFromError(reqErr), "Upstream Gemini request failed")
+				}
 				return
 			}
 			retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries, continuousRetryPolicy)
@@ -454,10 +567,11 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			_ = resp.Body.Close()
-			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
+			upstreamCancel()
+			if continuousRetryCommitExpired(c, continuousRetryProtocolGemini) {
 				h.store.Release(account)
 				return
 			}
@@ -477,7 +591,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			}
 
 			antigravityRefreshFailed := resp.StatusCode == http.StatusUnauthorized && antigravityRefreshRetried[account.ID()]
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -510,6 +624,9 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 				}
 				continue
 			}
+			if !claimContinuousRetryTerminal(c, continuousRetryProtocolGemini) {
+				return
+			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
@@ -518,58 +635,103 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			c.Header("Content-Type", "text/event-stream; charset=utf-8")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
+			c.Header("X-Accel-Buffering", "no")
 			c.Status(resp.StatusCode)
-			_, copyErr := io.Copy(c.Writer, resp.Body)
+			result := forwardGeminiNativeStream(c, resp.Body, start)
 			_ = resp.Body.Close()
+			upstreamCancel()
 			h.store.Release(account)
-			if copyErr != nil && c.Request.Context().Err() != nil {
-				return
+			durationMs = int(time.Since(start).Milliseconds())
+			ctxErr := continuousRetryContextError(c.Request.Context())
+			// The native reader only returns a clean EOF after a real Gemini
+			// terminal. A successful upstream read still requires delivery to the
+			// downstream client before this request can be recorded as successful.
+			completed := result.readErr == nil && result.writeErr == nil && ctxErr == nil
+			outcome := classifyStreamOutcome(ctxErr, result.readErr, result.writeErr, completed)
+			var upstreamStreamErr *antigravityStreamError
+			if ctxErr == nil && result.writeErr == nil && errors.As(result.readErr, &upstreamStreamErr) {
+				outcome = h.antigravityStreamErrorOutcome(account, upstreamStreamErr, resp, model)
 			}
-			if !claimContinuousRetrySuccess(c, continuousRetryProtocolResponses) {
-				return
+			if !claimContinuousRetrySuccessContext(c.Request.Context()) {
+				outcome = classifyStreamOutcome(errContinuousRetryDeadlineExceeded, nil, nil, false)
+			}
+			if outcome.penalize {
+				h.reportStreamOutcomeFailure(account, outcome, time.Since(start))
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			if outcome.logStatusCode != http.StatusOK {
+				if !writeContinuousRetryTimeoutResponse(c, continuousRetryProtocolGemini) && ctxErr == nil && result.writeErr == nil {
+					status, message := http.StatusBadGateway, "Upstream Gemini stream failed before completion"
+					if upstreamStreamErr != nil {
+						// Gemini clients retry RESOURCE_EXHAUSTED/UNAVAILABLE themselves,
+						// so keep the upstream status instead of a generic 502.
+						status = upstreamStreamErr.StatusCode
+						if text := strings.TrimSpace(gjson.GetBytes(upstreamStreamErr.Body, "error.message").String()); text != "" {
+							message = text
+						}
+					}
+					writeGeminiNativeError(c, status, message)
+				}
 			}
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         inboundEndpoint,
-				Model:            model,
-				EffectiveModel:   model,
-				StatusCode:       http.StatusOK,
-				DurationMs:       durationMs,
-				InboundEndpoint:  inboundEndpoint,
-				UpstreamEndpoint: upstreamEndpoint,
-				Stream:           true,
-				AttemptIndex:     attempt + 1,
+				AccountID:         account.ID(),
+				Endpoint:          inboundEndpoint,
+				Model:             model,
+				EffectiveModel:    model,
+				StatusCode:        outcome.logStatusCode,
+				DurationMs:        durationMs,
+				FirstTokenMs:      result.firstTokenMs,
+				PromptTokens:      result.usage.PromptTokens,
+				CompletionTokens:  result.usage.CompletionTokens,
+				InputTokens:       result.usage.InputTokens,
+				OutputTokens:      result.usage.OutputTokens,
+				ReasoningTokens:   result.usage.ReasoningTokens,
+				CachedTokens:      result.usage.CachedTokens,
+				TotalTokens:       result.usage.TotalTokens,
+				InboundEndpoint:   inboundEndpoint,
+				UpstreamEndpoint:  upstreamEndpoint,
+				Stream:            true,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: outcome.failureKind,
+				ErrorMessage:      usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			})
 			return
 		}
 
 		out, readErr := readAllWithContinuousRetryKeepalive(c.Request.Context(), io.LimitReader(resp.Body, antigravityResponseBodyLimit))
 		_ = resp.Body.Close()
+		upstreamCancel()
 		if readErr != nil {
 			h.store.ReportRequestFailure(account, "upstream_read_error", time.Duration(durationMs)*time.Millisecond)
 			h.store.Release(account)
-			ErrorToGinResponse(c, readErr)
+			if claimContinuousRetryTerminal(c, continuousRetryProtocolGemini) && c.Request.Context().Err() == nil {
+				writeGeminiNativeError(c, http.StatusBadGateway, "Failed to read upstream Gemini response")
+			}
 			return
 		}
-		inputTokens, outputTokens, reasoningTokens, totalTokens := geminiNativeUsageFromBody(out)
+		usage := geminiNativeUsageFromBody(out)
+		if !claimContinuousRetrySuccess(c, continuousRetryProtocolGemini) {
+			h.store.Release(account)
+			return
+		}
 		c.Header("Content-Type", "application/json; charset=utf-8")
 		c.Status(resp.StatusCode)
 		_, _ = c.Writer.Write(out)
 		h.store.Release(account)
-		if !claimContinuousRetrySuccess(c, continuousRetryProtocolResponses) {
-			return
-		}
 		h.logUsageForRequest(c, &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         inboundEndpoint,
 			Model:            model,
 			EffectiveModel:   model,
 			StatusCode:       http.StatusOK,
-			DurationMs:       durationMs,
-			InputTokens:      inputTokens,
-			OutputTokens:     outputTokens,
-			ReasoningTokens:  reasoningTokens,
-			TotalTokens:      totalTokens,
+			DurationMs:       int(time.Since(start).Milliseconds()),
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			InputTokens:      usage.InputTokens,
+			OutputTokens:     usage.OutputTokens,
+			ReasoningTokens:  usage.ReasoningTokens,
+			CachedTokens:     usage.CachedTokens,
+			TotalTokens:      usage.TotalTokens,
 			InboundEndpoint:  inboundEndpoint,
 			UpstreamEndpoint: upstreamEndpoint,
 			Stream:           false,

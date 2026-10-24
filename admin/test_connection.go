@@ -24,6 +24,8 @@ import (
 var batchTestAccountTimeout = 30 * time.Second
 var batchTestWhamTimeout = 5 * time.Second
 
+var errAntigravityNoEnabledTestModel = errors.New("该 Antigravity 账号暂无可自动测试的模型，请手动选择禁用模型进行测试")
+
 // testEvent SSE 测试事件
 type testEvent struct {
 	Type    string `json:"type"`              // test_start | content | diagnostics | test_complete | error
@@ -35,6 +37,9 @@ type testEvent struct {
 	// diagnostics,Codex/Responses 测连用 codex_diagnostics,两者不会同时出现。
 	Diagnostics      *claudeTestDiagnostics `json:"diagnostics,omitempty"`
 	CodexDiagnostics *codexTestDiagnostics  `json:"codex_diagnostics,omitempty"`
+	// Interrupted 标记 error 事件是传输/流中断(连接失败、读流失败、无终态即断开),
+	// 而非上游明确拒绝;降智检测据此决定是否自动重试及展示"已中断"。
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
 type responsesTerminalOutcome uint8
@@ -147,6 +152,12 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	prompt := c.Query("prompt")
+	hasPrompt := quality == nil && c.Request.URL.Query().Has("prompt")
+	if hasPrompt && (strings.TrimSpace(prompt) == "" || len([]rune(prompt)) > auth.MaxTestContentRunes) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("测试内容不能为空，且不能超过 %d 个字符", auth.MaxTestContentRunes)})
+		return
+	}
 	claudeSecurityCfg := h.store.ClaudeSecurityConfig()
 	payload := h.buildAccountConnectionTestPayload(c.Request.Context(), account, testModel, claudeSecurityCfg)
 	if quality != nil {
@@ -154,6 +165,12 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
+		}
+	} else if hasPrompt {
+		if isClaudeAccount {
+			payload = buildClaudeConnectionTestPayloadWithContent(testModel, prompt, claudeSecurityCfg)
+		} else {
+			payload = buildTestPayloadWithContent(testModel, prompt)
 		}
 	}
 
@@ -197,13 +214,16 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 		resp, reqErr = h.executeAntigravityConnectionTest(c.Request.Context(), account, testModel, payload, h.store.ResolveProxyForAccount(account), !isTransient)
 	} else if isOpenAIResponsesAccount {
 		resp, reqErr = proxy.ExecuteRelayStyleRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
+	} else if quality != nil {
+		// 降智检测是一次性长生成(常达数分钟),不需要 WS 续链;强制走独立 HTTP SSE,
+		// 不受"强制 WebSocket"影响,也不占用/依赖池化长连接。
+		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil, false)
 	} else {
-		c.Request = c.Request.WithContext(proxy.WithCodexTurnStateAdminProbe(c.Request.Context()))
 		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	}
 	if reqErr != nil {
 		h.logConnectionTestTransportFailure(c, account, usageReason, usageEndpoint, testModel, usageEffort, start, reqErr)
-		event := testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())}
+		event := testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error()), Interrupted: true}
 		if isClaudeAccount {
 			event.Diagnostics = newClaudeTestRecorder(nil, testModel, claudeFingerprintMode, account.GetAccessToken(), start).finish()
 			event.Error = sanitizeClaudeTestText(event.Error, account.GetAccessToken())
@@ -424,11 +444,11 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 	})
 
 	if readErr != nil && !sentTerminal {
-		sendTestEvent(c, testEvent{Type: "error", Error: "读取上游流失败: " + readErr.Error()})
+		sendTestEvent(c, testEvent{Type: "error", Error: "读取上游流失败: " + readErr.Error(), Interrupted: true})
 		return
 	}
 	if !gotTerminal && !sentTerminal {
-		sendTestEvent(c, testEvent{Type: "error", Error: formatMissingTerminalUpstreamError(lastUpstreamEvent)})
+		sendTestEvent(c, testEvent{Type: "error", Error: formatMissingTerminalUpstreamError(lastUpstreamEvent), Interrupted: true})
 	}
 }
 
@@ -1012,20 +1032,6 @@ func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *au
 		return antigravityConnectionTestModel(account, requested, defaults...)
 	}
 	if account == nil || !account.IsRelayStyle() {
-		if account != nil {
-			_, scope, _ := account.CodexTurnStateConfig()
-			if strings.TrimSpace(scope) != "" {
-				if requested != "" && !proxy.CodexTurnStateModelAllowed(account, requested) {
-					return "", fmt.Errorf("测试模型不在账号限定模型范围内: %s", requested)
-				}
-				if requested == "" {
-					for _, candidate := range h.codexTurnStateRefreshModels(ctx, account) {
-						return candidate, nil
-					}
-					return "", fmt.Errorf("账号限定范围内没有可用的测试模型")
-				}
-			}
-		}
 		if requested == "" {
 			return h.connectionTestModel(ctx), nil
 		}
@@ -1079,14 +1085,14 @@ func isTextConnectionModel(model string) bool {
 	return model != "" && !strings.Contains(model, "image")
 }
 
-// antigravityConnectionTestModels 是 Antigravity 账号可用于测连的文本模型：
-// 把账号同步到的 wire 目录（或安全默认集）投影成对外发布的固定档位 ID，
-// 与账号页下拉、/v1/models 暴露的是同一份真相。
+// antigravityConnectionTestModels projects the account's catalog for explicit
+// admin tests. Disabled placeholders keep their original ID here, while normal
+// inference and automatic test selection continue to exclude them.
 func antigravityConnectionTestModels(account *auth.Account) []string {
 	if account == nil {
 		return nil
 	}
-	published := proxy.AntigravityPublishedModelIDs(account.AntigravityModels())
+	published := proxy.AntigravityAdminModelIDs(account.AntigravityModels())
 	models := make([]string, 0, len(published))
 	for _, model := range published {
 		if isTextConnectionModel(model) {
@@ -1113,6 +1119,16 @@ func antigravityConnectionTestModel(account *auth.Account, requested string, def
 			}
 		}
 		return "", fmt.Errorf("该 Antigravity 账号不支持测试模型: %s", requested)
+	}
+	enabled := models[:0]
+	for _, model := range models {
+		if !proxy.AntigravityDisabledModel(model) {
+			enabled = append(enabled, model)
+		}
+	}
+	models = enabled
+	if len(models) == 0 {
+		return "", errAntigravityNoEnabledTestModel
 	}
 	for _, defaultModel := range defaultModels {
 		defaultModel = strings.TrimSpace(defaultModel)
@@ -1183,6 +1199,16 @@ func antigravityModelVersion(model string) float64 {
 // 与调度路径一致：OAuth 号收到 401 先用 RT 换一次 AT 再重试一次，避免仅因
 // AT 过期就把号标成未授权；allowRefresh=false（回收站临时账号）不回写凭据。
 func (h *Handler) executeAntigravityConnectionTest(ctx context.Context, account *auth.Account, model string, payload []byte, proxyURL string, allowRefresh bool) (*http.Response, error) {
+	validateDisabledModel := func() error {
+		if proxy.AntigravityDisabledModel(model) {
+			_, err := antigravityConnectionTestModel(account, model)
+			return err
+		}
+		return nil
+	}
+	if err := validateDisabledModel(); err != nil {
+		return nil, err
+	}
 	execute := h.antigravityProbeExecutor()
 	resp, err := execute(ctx, account, model, payload, true, proxyURL)
 	if err != nil || resp == nil {
@@ -1198,6 +1224,11 @@ func (h *Handler) executeAntigravityConnectionTest(ctx context.Context, account 
 	}
 	if resp.Body != nil {
 		_ = resp.Body.Close()
+	}
+	// Refresh may replace the catalog as well as the token. Do not retry a
+	// disabled placeholder that is no longer owned by this account.
+	if err := validateDisabledModel(); err != nil {
+		return nil, err
 	}
 	return execute(ctx, account, model, payload, true, proxyURL)
 }
@@ -1625,7 +1656,9 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if msg, ok := batchTestContextFailure(testCtx, modelErr); ok {
 			return "failed", msg
 		}
-		h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		if !errors.Is(modelErr, errAntigravityNoEnabledTestModel) {
+			h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		}
 		return "failed", modelErr.Error()
 	}
 	securityCfg := h.store.ClaudeSecurityConfig()
@@ -1641,7 +1674,6 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 	} else if acc.IsRelayStyle() {
 		resp, err = proxy.ExecuteRelayStyleRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
 	} else {
-		testCtx = proxy.WithCodexTurnStateAdminProbe(testCtx)
 		resp, err = proxy.ExecuteRequest(testCtx, acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 	}
 	if err != nil {
@@ -1786,7 +1818,6 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 	} else if acc.IsRelayStyle() {
 		resp, err = proxy.ExecuteRelayStyleRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
 	} else {
-		testCtx = proxy.WithCodexTurnStateAdminProbe(testCtx)
 		resp, err = proxy.ExecuteRequest(testCtx, acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 	}
 	if err != nil {

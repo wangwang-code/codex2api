@@ -76,6 +76,11 @@ func (h *Handler) GetPublicAPIKeyUsageSummary(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	logFilter, err := parsePublicAPIKeyUsageLogFilter(c.Query("model"), c.Query("endpoint"), c.Query("status"), c.Query("stream"), c.Query("channel"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
@@ -90,8 +95,15 @@ func (h *Handler) GetPublicAPIKeyUsageSummary(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	// 停用是管理员吊销凭据，与代理链路一致直接拒绝；过期/额度用尽仍可读，
+	// 让持有者看到状态与历史用量，明白调用为何失败。
+	if !row.Enabled {
+		security.SecurityAuditLog("KEY_USAGE_AUTH_FAILED_DISABLED_KEY", "ip="+security.SanitizeLog(c.ClientIP())+" key="+security.MaskAPIKey(key))
+		writeError(c, http.StatusUnauthorized, "API Key 已停用")
+		return
+	}
 
-	report, err := h.db.GetAPIKeySelfUsageReport(ctx, row.ID, rangeStart, rangeEnd, logPage, logPageSize)
+	report, err := h.db.GetAPIKeySelfUsageReportFiltered(ctx, row.ID, rangeStart, rangeEnd, logPage, logPageSize, logFilter)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -154,6 +166,9 @@ func parsePublicAPIKeyUsageLogPagination(pageRaw, pageSizeRaw string) (int, int,
 		if err != nil || parsed < 1 {
 			return 0, 0, errors.New("page 参数无效，需要正整数")
 		}
+		if parsed > maxAdminPage {
+			return 0, 0, errors.New("page 参数过大")
+		}
 		page = parsed
 	}
 
@@ -171,6 +186,37 @@ func parsePublicAPIKeyUsageLogPagination(pageRaw, pageSizeRaw string) (int, int,
 	}
 
 	return page, pageSize, nil
+}
+
+const publicAPIKeyUsageMaxFilterLen = 128
+
+func parsePublicAPIKeyUsageLogFilter(model, endpoint, status, stream, channel string) (database.APIKeySelfLogFilter, error) {
+	filter := database.APIKeySelfLogFilter{
+		Model:    strings.TrimSpace(model),
+		Endpoint: strings.TrimSpace(endpoint),
+		Status:   strings.ToLower(strings.TrimSpace(status)),
+		Stream:   strings.ToLower(strings.TrimSpace(stream)),
+		Channel:  strings.ToLower(strings.TrimSpace(channel)),
+	}
+	if len(filter.Model) > publicAPIKeyUsageMaxFilterLen || len(filter.Endpoint) > publicAPIKeyUsageMaxFilterLen {
+		return database.APIKeySelfLogFilter{}, errors.New("model / endpoint 参数过长")
+	}
+	switch filter.Status {
+	case "", "success", "error", "4xx", "5xx", "429":
+	default:
+		return database.APIKeySelfLogFilter{}, errors.New("status 参数仅支持 success、error、4xx、5xx、429")
+	}
+	switch filter.Stream {
+	case "", "stream", "sync":
+	default:
+		return database.APIKeySelfLogFilter{}, errors.New("stream 参数仅支持 stream、sync")
+	}
+	switch filter.Channel {
+	case "", "codex", "grok", "antigravity", "claude":
+	default:
+		return database.APIKeySelfLogFilter{}, errors.New("channel 参数仅支持 codex、grok、antigravity、claude")
+	}
+	return filter, nil
 }
 
 func parsePublicAPIKeyUsageRange(raw string) (string, time.Time, time.Time, error) {

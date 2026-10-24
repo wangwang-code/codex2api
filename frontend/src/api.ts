@@ -1,4 +1,4 @@
-import { turnStateHistoryQuery, type TurnStateHistoryFilter, type TurnStateHistoryPage } from './lib/turnStateHistory.ts'
+import { intelligenceQuery, type IntelligenceSettings, type IntelligenceAccount, type IntelligenceRun, type IntelligenceBar, type IntelligencePage } from './lib/intelligenceCheck.ts'
 import { qualityTestFilterQuery, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
 import type {
   AccountEventTrendPoint,
@@ -58,6 +58,9 @@ import type {
   AccountPageStatsResponse,
   AccountLiveStateResponse,
   ChartAggregation,
+  ChannelMonitorConfig,
+  ChannelMonitorBillingRatesResponse,
+  ChannelMonitorListResponse,
   CreateAccountResponse,
   CreateAPIKeyResponse,
   CreateAPIKeyRequest,
@@ -114,6 +117,7 @@ import type {
   PromptReviewTestRequest,
   PromptReviewTestResponse,
   PromptReviewAPIKeysResponse,
+  PublicAPIKeyUsageLogFilter,
   PublicAPIKeyUsageResponse,
   ImageStudioQuota,
   RecycleBinAccountsResponse,
@@ -131,6 +135,7 @@ import type {
   CodexUserAgentCatalog,
   CodexUserAgentPreview,
   UpdateAccountSchedulerRequest,
+  UpdateChannelMonitorConfigRequest,
   UpdateAPIKeyRequest,
   UpdatePromptFilterNewAPIBindingRequest,
   UpdateOAuthAccountRequest,
@@ -537,6 +542,28 @@ export function buildUsageLogSearchParams(params: UsageLogQueryParams) {
   return search
 }
 
+export interface ModelTraceBankInfo {
+  origin: 'embedded' | 'override'
+  revision: string
+  built_at: string
+  models: string[]
+}
+
+export interface ModelTraceBankStatus {
+  active: ModelTraceBankInfo
+  embedded: ModelTraceBankInfo
+  override?: ModelTraceBankInfo
+  override_stale?: boolean
+  override_error?: string
+}
+
+export interface ModelTraceBankUpdateResult extends ModelTraceBankStatus {
+  updated: boolean
+  message: string
+  added_models?: string[]
+  removed_models?: string[]
+}
+
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   // 公开账号自助门户:生成 OpenAI 授权链接(无鉴权)。
@@ -551,11 +578,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } = {}) => {
+  getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } & PublicAPIKeyUsageLogFilter = {}) => {
     const search = new URLSearchParams()
     search.set('range', range)
     if (params.page) search.set('page', String(params.page))
     if (params.pageSize) search.set('page_size', String(params.pageSize))
+    if (params.model) search.set('model', params.model)
+    if (params.endpoint) search.set('endpoint', params.endpoint)
+    if (params.status) search.set('status', params.status)
+    if (params.stream) search.set('stream', params.stream)
+    if (params.channel) search.set('channel', params.channel)
     return requestAPIKeyUsage<PublicAPIKeyUsageResponse>(`/summary?${search.toString()}`, apiKey)
   },
   getPortalImageQuota: (apiKey: string) =>
@@ -657,6 +689,22 @@ export const api = {
       `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
       { signal, timeoutMs: 25_000 },
     ),
+  getChannelMonitorConfig: (id: number, signal?: AbortSignal) =>
+    request<ChannelMonitorConfig>(`/accounts/${id}/channel-monitor`, { signal }),
+  updateChannelMonitorConfig: (id: number, data: UpdateChannelMonitorConfigRequest) =>
+    request<ChannelMonitorConfig>(`/accounts/${id}/channel-monitor`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  getChannelMonitors: (signal?: AbortSignal) =>
+    request<ChannelMonitorListResponse>('/channel-monitors', { signal }),
+  getChannelMonitorBillingRates: (signal?: AbortSignal) =>
+    request<ChannelMonitorBillingRatesResponse>('/channel-monitors/billing-rates', { signal }),
+  probeChannelMonitor: (id: number) =>
+    request<MessageResponse>(`/channel-monitors/${id}/probe`, {
+      method: 'POST',
+      timeoutMs: 80_000,
+    }),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
@@ -1004,7 +1052,7 @@ export const api = {
       body: JSON.stringify({ channels }),
     }),
   getAntigravitySettings: () => request<AntigravitySettingsResponse>('/settings/antigravity'),
-  updateAntigravitySettings: (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean }) =>
+  updateAntigravitySettings: (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean; expose_thoughts?: boolean }) =>
     request<AntigravitySettingsResponse>('/settings/antigravity', {
       method: 'PUT',
       body: JSON.stringify(patch),
@@ -1038,7 +1086,7 @@ export const api = {
   },
   updateAccountCredit: (id: number, data: { credit_enabled: boolean; credit_skip_usage_window: boolean }) =>
     request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
-  getHealth: () => request<HealthResponse>('/health'),
+  getHealth: (options?: { timeoutMs?: number }) => request<HealthResponse>('/health', options),
   getPromptFilterNewAPIBindings: () =>
     request<PromptFilterNewAPIBindingsResponse>('/prompt-filter/newapi-bindings'),
   getPromptFilterNewAPIBinding: (apiKeyId: number) =>
@@ -1200,7 +1248,10 @@ export const api = {
     sp.set('bucket_minutes', String(params.bucketMinutes))
     return request<{ trend: AccountEventTrendPoint[] }>(`/accounts/event-trend?${sp.toString()}`)
   },
-  getAPIKeys: () => request<APIKeysResponse>('/keys'),
+  // view: 'lite' — 只要密钥行本身,跳过窗口费用/最近使用时间的日志聚合(筛选下拉等场景)。
+  getAPIKeys: (params: { view?: 'lite' } = {}) =>
+    request<APIKeysResponse>(params.view ? `/keys?view=${params.view}` : '/keys'),
+  getAPIKeyConcurrency: () => request<{ concurrency: Record<string, number> }>('/keys-concurrency'),
   createAPIKey: (data: CreateAPIKeyRequest) =>
     request<CreateAPIKeyResponse>('/keys', {
       method: 'POST',
@@ -1470,6 +1521,14 @@ export const api = {
   dismissPromptIntelligenceCandidate: (id: number) =>
     request<import('./types').PromptIntelligenceCandidate>(`/prompt-filter/intelligence/candidates/${id}/dismiss`, { method: 'POST' }),
   getModels: () => request<ModelsResponse>('/models'),
+  getIntelligenceSettings: (signal?: AbortSignal) => request<IntelligenceSettings>('/intelligence-check/settings', { signal }),
+  saveIntelligenceSettings: (body: IntelligenceSettings) => request<IntelligenceSettings>('/intelligence-check/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  getIntelligenceAccounts: (page = 1, filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => request<IntelligencePage<IntelligenceAccount>>(`/intelligence-check/accounts?${intelligenceQuery(page, filters)}`, { signal }),
+  setIntelligenceAccounts: (account_ids: number[], enabled: boolean) => request<{ updated: number }>('/intelligence-check/accounts', { method: 'PATCH', body: JSON.stringify({ account_ids, enabled }) }),
+  createIntelligenceRuns: (account_ids: number[]) => request<{ runs: IntelligenceRun[] }>('/intelligence-check/runs', { method: 'POST', body: JSON.stringify({ account_ids }) }),
+  getIntelligenceRuns: (page = 1, filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => request<IntelligencePage<IntelligenceRun>>(`/intelligence-check/runs?${intelligenceQuery(page, filters)}`, { signal }),
+  getIntelligenceRun: (id: number, signal?: AbortSignal) => request<{ run: IntelligenceRun }>(`/intelligence-check/runs/${id}`, { signal }),
+  getIntelligenceBars: (ids: number[], signal?: AbortSignal) => request<{ bars: Record<string, IntelligenceBar> }>(`/intelligence-check/bars?account_ids=${ids.join(',')}`, { signal }),
   getQualityTestOptions: (id: number, signal?: AbortSignal) =>
     request<{ models: string[]; reasoning_efforts: string[] }>(`/accounts/${id}/quality-test/options`, { signal }),
   getQualityTestPrompts: (signal?: AbortSignal) =>
@@ -1480,10 +1539,8 @@ export const api = {
     request<{ prompt: QualityTestPrompt }>(`/quality-test-prompts/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteQualityTestPrompt: (id: number) =>
     request<{ message: string }>(`/quality-test-prompts/${id}`, { method: 'DELETE' }),
-  createQualityTest: (accountId: number, body: { model: string; reasoning_effort: string; prompt: string; prompt_id?: number; preset_key?: string; preset_name?: string }) =>
+  createQualityTest: (accountId: number, body: { model: string; reasoning_effort: string; prompt: string; prompt_id?: number; preset_key?: string; preset_name?: string; timeout_minutes?: number }) =>
     request<{ job: QualityTestJob }>(`/accounts/${accountId}/quality-test`, { method: 'POST', body: JSON.stringify(body) }),
-  getTurnStateHistory: (page: number, filter: TurnStateHistoryFilter = {}, signal?: AbortSignal) =>
-    request<TurnStateHistoryPage>(`/codex-turn-state/renewals?${turnStateHistoryQuery(page, filter)}`, { signal }),
   getQualityTests: (page = 1, filter: QualityTestJobsFilter = {}, signal?: AbortSignal) =>
     request<QualityTestJobsResponse>(`/quality-tests?${qualityTestFilterQuery(page, filter)}`, { signal }),
   getQualityTest: (id: number, signal?: AbortSignal) =>
@@ -1498,6 +1555,8 @@ export const api = {
       builtin_version: string
       updated: boolean
     }>('/codex-cli-version/sync', { method: 'POST' }),
+  syncCodexClientVersions: () =>
+    request<Record<'cli' | 'desktop_mac' | 'desktop_windows' | 'vscode', import('./types').CodexClientVersionSyncResult>>('/codex-client-versions/sync', { method: 'POST' }),
   listModelPricing: () =>
     request<{
       models: Array<{
@@ -1526,6 +1585,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ url: url ?? '' }),
     }),
+  getModelTraceBank: () => request<ModelTraceBankStatus>('/modeltrace/bank'),
+  updateModelTraceBank: () =>
+    request<ModelTraceBankUpdateResult>('/modeltrace/bank/update', { method: 'POST', timeoutMs: 120_000 }),
+  resetModelTraceBank: () => request<ModelTraceBankStatus>('/modeltrace/bank', { method: 'DELETE' }),
 	updateOfficialPricingSyncConfig: (config: Pick<OfficialPricingSyncConfig, 'enabled' | 'interval_minutes' | 'include_openai' | 'include_grok' | 'include_claude'>) =>
 		request<OfficialPricingSyncConfig>('/model-pricing/official-sync/config', {
 			method: 'PUT',
@@ -1584,6 +1647,9 @@ export const api = {
   },
   downloadAccountAuthJSON: (id: number) =>
     requestBlob(`/accounts/${id}/auth-json`),
+  // Grok CLI(~/.grok/auth.json)格式;不带 refresh token 时不会与网关争用同一 RT 家族。
+  downloadGrokAuthJSON: (id: number, includeRefreshToken: boolean) =>
+    requestBlob(`/accounts/${id}/grok/auth-json?include_refresh_token=${includeRefreshToken}`),
   /**
    * 导出 Grok 账号凭据。ids 为空则导出全部 Grok 账号。
    * 单个账号返回裸 JSON，多个账号返回 ZIP（内部每账号一个 <邮箱>.json）。

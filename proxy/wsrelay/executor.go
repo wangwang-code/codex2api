@@ -16,6 +16,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -116,11 +117,6 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		ctx = context.Background()
 	}
 
-	ctx = proxy.BeginCodexTurnStateTemplateAttempt(ctx)
-	if dedicated := proxy.CodexTurnStateRefreshProxy(ctx, account); dedicated != "" {
-		proxyOverride = dedicated
-	}
-
 	account.Mu().RLock()
 	accessToken := account.AccessToken
 	accountIDStr := account.AccountID
@@ -148,17 +144,17 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	wsURL = egress.URL
 
 	// 准备请求头
-	// Outbound turn-state order (WS handshake): Guard foreign echo → auto
-	// template Apply (if setting on) → manual credential inject last (ops override).
+	// 跨账号回声守卫在握手头装配末尾剥离已知来自其他账号的 turn state。
 	affinityKey := proxy.CodexTurnStateAffinityKeyFromContext(ctx)
-	headers := e.prepareWebsocketHeaders(ctx, accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody, affinityKey)
-	// 凭据级 turn state 注入在 Guard/模板 Apply 与账号自定义头之后落定（帧体已由 proxy.ExecuteRequest 写入）。
-	proxy.ApplyCodexTurnStateInjectionHeader(ctx, headers)
+	headers, err := e.prepareWebsocketHeadersChecked(ctx, accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody, affinityKey)
+	if err != nil {
+		return nil, err
+	}
 	// 握手头在复用连接上不会重发；每轮必须把最终状态同步到 response.create。
 	if state := headers.Get("X-Codex-Turn-State"); state != "" {
-		wsBody, _ = sjson.SetBytes(wsBody, "client_metadata.x-codex-turn-state", state)
+		wsBody = jsonbody.SetString(wsBody, "client_metadata.x-codex-turn-state", state)
 	} else {
-		wsBody, _ = sjson.DeleteBytes(wsBody, "client_metadata.x-codex-turn-state")
+		wsBody = jsonbody.DeletePath(wsBody, "client_metadata.x-codex-turn-state")
 	}
 	// Record the attempted handshake UA immediately so failed handshakes are
 	// still auditable. A reused connection replaces this below with the UA that
@@ -187,14 +183,21 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 否则落到随机槽位会触发上游 "previous response not found"。
 	// 同线程上的后台副请求（request_kind=memory、guardian 子代理）另成一道，
 	// 不与用户在飞轮次同键排队；Desktop 走 HTTP 时元数据只在请求体里。
-	poolSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, wsBody)
+	// The original envelope owns local lane isolation. Its stream_id is not a
+	// Codex backend field and has already been removed from the outbound body.
+	poolSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, requestBody)
+	ctx = withConnectionCapacityKind(ctx, ginHeaders, wsBody)
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
 	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
-			wc, pr, poolSessionID = pwc, ppr, slotKey
+		wc, pr, poolSessionID, err2 = e.acquireContinuation(ctx, websocketContinuation{
+			responseID: prevRespID, accountID: account.ID(), apiKey: apiKey, identity: websocketClientIdentity(headers),
+			model: gjson.GetBytes(wsBody, "model").String(), url: wsURL, proxyURL: requestProxyKey(ctx, account, proxyOverride),
+		})
+		if err2 != nil {
+			return nil, err2
 		}
 	}
 	baseKey := strings.TrimSpace(poolRouteKey)
@@ -207,7 +210,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// for a different template identity. prompt_cache_key / session header isolation
 	// comments above are unchanged.
 	baseKey = reusablePoolBaseKeyWithModel(baseKey, gjson.GetBytes(wsBody, "model").String())
+	baseKey = websocketClientPoolKey(baseKey, headers)
 	if wc == nil {
+		poolSessionID = websocketClientPoolKey(poolSessionID, headers)
 		// A pooled handshake must belong to the same mapped conversation/thread.
 		poolSessionID = proxy.ScopeCodexFingerprintTransportKey(poolSessionID, account, ginHeaders)
 		baseKey = proxy.ScopeCodexFingerprintTransportKey(baseKey, account, ginHeaders)
@@ -239,18 +244,21 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			e.manager.DiscardConnection(wc)
 		}
 		wc.session.RemovePendingRequest(pr.RequestID)
+		e.manager.releaseUnusedChatCapacity(wc)
 		return nil, err
 	}
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
+	if sendErr != nil && gjson.GetBytes(wsBody, "previous_response_id").String() != "" {
+		wc.session.RemovePendingRequest(pr.RequestID)
+		e.manager.DiscardConnection(wc)
+		return nil, &proxy.ResponsesContinuationLostError{Reason: "original_connection_send_failed"}
+	}
 	for retries := 0; shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
 
-		// 短暂退避，避免瞬间重连风暴
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(time.Duration(retries+1) * 200 * time.Millisecond):
+		if err := waitWebsocketSendRetry(ctx, retries); err != nil {
+			return nil, err
 		}
 
 		reacquireStart := time.Now()
@@ -273,17 +281,16 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 启动心跳
 	e.manager.StartHeartbeat(wc)
 
-	proxy.ConfirmCodexTurnStateTemplate(ctx, headers, account, gjson.GetBytes(wsBody, "model").String())
 	return &WsResponse{
-		turnStateContext: ctx,
-		account:          account,
-		model:            gjson.GetBytes(wsBody, "model").String(),
-		conn:             wc,
-		pendingReq:       pr,
-		sessionID:        poolSessionID,
-		manager:          e.manager,
-		apiKey:           apiKey,
-		readErrChan:      make(chan error, 1),
+		conn:              wc,
+		pendingReq:        pr,
+		sessionID:         poolSessionID,
+		manager:           e.manager,
+		apiKey:            apiKey,
+		model:             gjson.GetBytes(wsBody, "model").String(),
+		readErrChan:       make(chan error, 1),
+		upstreamUserAgent: wc.upstreamUserAgent,
+		upstreamVersion:   wc.upstreamVersion,
 	}, nil
 }
 
@@ -320,9 +327,12 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	}
 
 	// 2. 清理多余字段（prompt_cache_retention 上游不接受，会返回 400 Unsupported parameter，必须删除）
-	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
-	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
-	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
+	wsBody = jsonbody.DeletePath(wsBody, "prompt_cache_retention")
+	wsBody = jsonbody.DeletePath(wsBody, "safety_identifier")
+	wsBody = jsonbody.DeletePath(wsBody, "disable_response_storage")
+	// Downstream named lanes are multiplexed locally onto independent leases.
+	// Their routing envelope must not reach the single-response Codex socket.
+	wsBody = jsonbody.DeletePath(wsBody, "stream_id")
 
 	// 3. 注入 prompt_cache_key
 	// stateless sessionID 只是连接池隔离用的一次性随机 ID，注入它会让上游
@@ -330,14 +340,14 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	//（由 proxy.ExecuteRequest 注入或客户端自带）。
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String())
 	if sessionID != "" && !proxy.IsStatelessWebsocketSessionID(sessionID) {
-		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", sessionID)
+		wsBody = jsonbody.SetString(wsBody, "prompt_cache_key", sessionID)
 	} else if existingCacheKey != "" {
-		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", existingCacheKey)
+		wsBody = jsonbody.SetString(wsBody, "prompt_cache_key", existingCacheKey)
 	}
 
 	// 4. 设置请求类型和 stream
-	wsBody, _ = sjson.SetBytes(wsBody, "type", "response.create")
-	wsBody, _ = sjson.SetBytes(wsBody, "stream", true)
+	wsBody = jsonbody.SetString(wsBody, "type", "response.create")
+	wsBody = jsonbody.SetBool(wsBody, "stream", true)
 
 	return wsBody
 }
@@ -355,9 +365,9 @@ func reusablePoolBaseKeyWithModel(baseKey, model string) string {
 	return baseKey + "|m:" + model
 }
 
-// prepareWebsocketHeaders 准备 WebSocket 请求头。
+// prepareWebsocketHeadersChecked 准备 WebSocket 请求头；客户端身份解析失败时返回错误，不组装残缺握手头。
 // affinityKey 用于 turn-state 跨账号回声守卫；空串时守卫为空操作。
-func (e *Executor) prepareWebsocketHeaders(ctx context.Context, accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header, wsBody []byte, affinityKey string) http.Header {
+func (e *Executor) prepareWebsocketHeadersChecked(ctx context.Context, accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header, wsBody []byte, affinityKey string) (http.Header, error) {
 	headers := http.Header{}
 
 	// 认证头
@@ -366,20 +376,21 @@ func (e *Executor) prepareWebsocketHeaders(ctx context.Context, accessToken stri
 	// Beta header 启用 WebSocket 响应 API
 	headers.Set("OpenAI-Beta", responsesWebsocketBetaHeader)
 
-	usedGeneratedHeaders := false
+	if account == nil {
+		account = &auth.Account{AccountID: accountID}
+	}
+	identity, err := proxy.ResolveCodexOutboundClientIdentity(proxy.CodexClientIdentityInput{Account: account, APIKey: apiKey, DeviceConfig: deviceCfg, Headers: ginHeaders})
+	if err != nil {
+		return nil, err
+	}
+	usedGeneratedHeaders := identity.Generated
 	if shouldSendWebsocketUserAgent() {
-		if account == nil {
-			account = &auth.Account{AccountID: accountID}
-		}
-		var userAgent, version string
-		userAgent, version, usedGeneratedHeaders = proxy.ResolveCodexOutboundClientHeadersWithDecision(account, apiKey, deviceCfg, ginHeaders)
-		headers.Set("User-Agent", userAgent)
-		if version != "" {
-			headers.Set("Version", version)
+		headers.Set("User-Agent", identity.UserAgent)
+		if identity.Version != "" {
+			headers.Set("Version", identity.Version)
 		}
 	} else {
-		// Keep an explicit empty header entry so net/http Request.Write suppresses
-		// its implicit Go-http-client/1.1 fallback during the WS handshake.
+		// 显式空值抑制 Go 默认 UA；版本检查仍在组装前执行。
 		headers["User-Agent"] = []string{""}
 	}
 	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
@@ -394,29 +405,24 @@ func (e *Executor) prepareWebsocketHeaders(ctx context.Context, accessToken stri
 	// Originator：与 HTTP 路径同规则——生成 UA 时跟随生成的客户端前缀，
 	// 透传官方客户端时沿用下游值。
 	if usedGeneratedHeaders {
-		headers.Set("Originator", proxy.CodexOriginatorForGeneratedUserAgent(headers.Get("User-Agent")))
+		headers.Set("Originator", proxy.CodexOriginatorForGeneratedUserAgent(identity.UserAgent))
 	} else if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
 		headers.Set("Originator", originator)
 	} else {
 		headers.Set("Originator", proxy.Originator)
 	}
-	// X-Oai-Attestation：DeviceCheck 设备认证头（上游 openai/codex#20619），
-	// 仅在下游携带时透传，本代理不伪造（假 token 服务端验证必败，反而暴露）。
+	// 先透传下游证明；Windows Desktop 身份缺失时在账号自定义头之后补不可用状态。
 	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics", "X-Oai-Attestation"} {
 		if value := strings.TrimSpace(ginHeaders.Get(name)); value != "" {
 			headers.Set(name, value)
 		}
 	}
-	// 帧内回带可作为待替换输入，绝不作为缓存来源。
 	if headers.Get("X-Codex-Turn-State") == "" {
 		if state := strings.TrimSpace(gjson.GetBytes(wsBody, "client_metadata.x-codex-turn-state").String()); state != "" {
 			headers.Set("X-Codex-Turn-State", state)
 		}
 	}
-	// 跨账号回声守卫必须在模板替换/注入之前。
 	proxy.GuardCodexTurnStateEcho(affinityKey, account, headers)
-	// 292 模板替换/注入：在透传+守卫之后、指纹收敛之前。
-	proxy.ApplyCodexTurnStateTemplate(ctx, headers, account, strings.TrimSpace(gjson.GetBytes(wsBody, "model").String()))
 	// 指纹收敛：在透传之后覆盖客户端原值，在账号自定义头之前保留运维覆盖优先级。
 	// 握手头是逐连接冻结的，复用连接沿用建连时的取值；收敛值按账号恒定，正好与
 	// 这一语义相容。off 档为空操作。
@@ -438,12 +444,13 @@ func (e *Executor) prepareWebsocketHeaders(ctx context.Context, accessToken stri
 		}
 		headers.Set(name, value)
 	}
+	proxy.ApplyWindowsDesktopAttestation(headers, account)
 
 	// routing hint 由网关按最终 WS 帧体合成，在账号自定义头之后设置。
 	// 握手头逐连接冻结：复用连接沿用建连时的 hint，语义为拨号期软亲和。
 	proxy.ApplyCodexRoutingHint(headers, account, wsBody)
 
-	return headers
+	return headers, nil
 }
 
 // sendRequest 发送 WebSocket 请求
@@ -461,17 +468,18 @@ func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) 
 
 // WsResponse WebSocket 响应包装器
 type WsResponse struct {
-	turnStateContext context.Context
-	account          *auth.Account
-	model            string
-	conn             *WsConnection
-	pendingReq       *PendingRequest
-	sessionID        string
-	manager          *Manager
-	readErrChan      chan error
-	closed           bool
+	model       string
+	conn        *WsConnection
+	pendingReq  *PendingRequest
+	sessionID   string
+	manager     *Manager
+	readErrChan chan error
+	closed      bool
 	// apiKey 发起本请求的下游 API Key，用于 response_id → 连接绑定的归属校验。
 	apiKey string
+	// 承载本请求的连接在握手时发出的客户端身份。
+	upstreamUserAgent string
+	upstreamVersion   string
 	// connBroken 标记读流因上游 WS 异常(非正常关闭)或下游写入失败而终止；
 	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
@@ -544,7 +552,9 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 			r.markConnBroken()
 		}
 		// 把错误内容作为 SSE 数据写给下游，让客户端看到完整错误 JSON。
-		callback(errEvent)
+		if !callback(errEvent) {
+			r.markConnBroken()
+		}
 		// 错误即终止：结束流(等价于 response.failed)。
 		return io.EOF
 	}
@@ -552,29 +562,29 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	// 标准化完成事件类型
 	payload = normalizeCompletionEvent(payload)
 
+	// 终态先记录绑定与完成状态，再交给下游。
+	eventType := gjson.GetBytes(payload, "type").String()
+	terminal := isReadLeaseTerminal(payload)
+	if eventType == "response.completed" || eventType == "response.incomplete" {
+		r.bindCompletedResponse(gjson.GetBytes(payload, "response.id").String())
+	}
+	if terminal {
+		// 下游读到终态即可取消请求；提前标记，避免取消回调误销毁已完成连接。
+		r.markStreamCompleted()
+	}
 	// 调用回调
 	if !callback(payload) {
 		// 下游写入失败(broken pipe / 客户端断开)：响应流在非终止边界被截断，
 		// 上游仍会在这条连接上继续推送本响应的剩余帧。连接必须销毁，
 		// 归还池中复用会把残留帧串给下一个请求(issue #308)。
-		r.markConnBroken()
+		if !terminal {
+			r.markConnBroken()
+		}
 		return io.EOF
 	}
 
 	// 检查是否是终止事件
-	eventType := gjson.GetBytes(payload, "type").String()
-	if eventType == "response.completed" || eventType == "response.failed" {
-		// 续链亲和：记录本响应由哪条连接产出，后续带 previous_response_id 的
-		// 请求可回到原连接（上游无服务端存储时上下文只存活在连接内）。
-		if eventType == "response.completed" && r.manager != nil && r.conn != nil {
-			if respID := gjson.GetBytes(payload, "response.id").String(); respID != "" {
-				accountID := int64(0)
-				if r.conn.session != nil {
-					accountID = r.conn.session.AccountID
-				}
-				r.manager.BindResponseConn(respID, r.conn, r.sessionID, accountID, r.apiKey)
-			}
-		}
+	if terminal {
 		return io.EOF
 	}
 
@@ -663,6 +673,9 @@ func (r *WsResponse) markConnBroken() {
 	r.mu.Lock()
 	r.connBroken = true
 	r.mu.Unlock()
+	if r.manager != nil && r.conn != nil {
+		r.manager.DiscardConnection(r.conn)
+	}
 }
 
 // markStreamCompleted 标记读流已消费到明确的终止边界（幂等，受 mu 保护）。
@@ -698,7 +711,11 @@ func (r *WsResponse) Close() error {
 		if !r.connBroken && r.streamCompleted && !r.shouldDiscardOneShotConn() {
 			r.manager.ReleaseConnection(r.conn)
 		} else {
-			r.manager.DiscardConnection(r.conn)
+			reason := closeUnconsumed
+			if !r.connBroken && r.streamCompleted {
+				reason = closeOneShotComplete
+			}
+			r.manager.discardConnectionFor(r.conn, reason)
 		}
 	}
 
@@ -709,13 +726,10 @@ func (r *WsResponse) Close() error {
 // 这类连接的池键每请求唯一，归还池后不可能再被按键复用，只会占用账号连接名额
 // 直到空闲超时；唯一的保留价值是 response_id 续链亲和（上游无服务端存储时，
 // previous_response_id 的上下文只存活在产出响应的那条连接里），因此有存活绑定时
-// 仍归还池。CODEX_WS_STATELESS_ONESHOT 模式显式承诺用完即毁，无条件销毁。
+// 仍归还池；一次性模式只禁止通用槽位复用，不应破坏已经产生的续链。
 func (r *WsResponse) shouldDiscardOneShotConn() bool {
 	if r.conn == nil || r.conn.session == nil || !proxy.IsStatelessWebsocketSessionID(r.conn.session.ID) {
 		return false
-	}
-	if statelessOneShotEnabled() {
-		return true
 	}
 	return r.manager == nil || !r.manager.hasLiveResponseBinding(r.conn)
 }
@@ -822,6 +836,17 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 
 	// 连接握手的状态不是本轮上游响应；复用时不可重采集或回传旧快照。
 	resp.Header.Del("X-Codex-Turn-State")
+	// 与 HTTP 响应一样带上出站身份，供"模型不支持"区分客户端版本闸。
+	if wsResp != nil && (wsResp.upstreamUserAgent != "" || wsResp.upstreamVersion != "") {
+		outbound := make(http.Header)
+		if wsResp.upstreamUserAgent != "" {
+			outbound.Set("User-Agent", wsResp.upstreamUserAgent)
+		}
+		if wsResp.upstreamVersion != "" {
+			outbound.Set("Version", wsResp.upstreamVersion)
+		}
+		resp.Request = &http.Request{Method: http.MethodGet, Header: outbound}
+	}
 	// 设置 SSE 响应头
 	resp.Header.Set("Content-Type", "text/event-stream")
 	resp.Header.Set("Cache-Control", "no-cache")
@@ -845,25 +870,9 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 		defer pw.Close()
 		defer wsResp.Close()
 
-		var turnState string
-		observed := false
-		observe := func() {
-			if !observed && turnState != "" {
-				observed = true
-				proxy.CaptureCodexTurnStateTemplate(wsResp.turnStateContext, wsResp.account, wsResp.model, http.Header{"X-Codex-Turn-State": []string{turnState}})
-			}
-		}
-		defer observe()
 		err := wsResp.ReadStream(func(data []byte) bool {
 			// 上游回带的 turn state 只在帧里（握手头是建连时的旧快照），逐帧观测记进追踪。
-			if state := proxy.ObserveCodexTurnStateFrame(ctx, data); state != "" {
-				turnState = state
-			}
-			// 同一轮可能多次携带 metadata，只按最终形态计一次；终止帧发布前入缓存。
-			switch gjson.GetBytes(data, "type").String() {
-			case "response.completed", "response.failed", "error":
-				observe()
-			}
+			proxy.ObserveCodexTurnStateFrame(ctx, data)
 			// SSE 的 data: 负载以换行为界，含换行的帧（如 pretty-printed JSON）
 			// 必须先压缩成单行，否则下游解析器只能读到第一行。
 			if bytes.IndexByte(data, '\n') >= 0 {

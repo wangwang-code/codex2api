@@ -200,6 +200,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	proxyURL = requestProxyURL(ctx, proxyURL)
 	if accessToken == "" {
 		return nil, ErrNoAvailableAccount()
 	}
@@ -241,7 +242,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
-	client := getPooledClient(account, proxyURL)
+	client := getRequestClient(ctx, account, proxyURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, claudeMessagesEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, ErrInternalError("创建 Claude 请求失败", err)
@@ -267,7 +268,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recycleRequestClient(ctx, account, proxyURL)
 		}
 		return nil, ErrUpstream(0, "请求 Anthropic Messages API 失败", err)
 	}
@@ -313,7 +314,7 @@ func claudeUpstreamSessionID(raw string) string {
 	return DeriveStableSessionUUIDv7("codex2api:claude-session:" + raw)
 }
 
-// resolveClaudeRequestSessionIdentity 仅在 Claude 原生路径识别 CLI 身份：
+// resolveClaudeRequestSessionIdentity 在 Claude 原生与 Messages 映射路径识别 CLI 身份：
 // 专用会话头 > 结构化 user_id.session_id > 既有通用会话来源。
 // 仍交给既有解析器处理本地 affinity，并由 handler 按 API Key 隔离上游身份。
 func resolveClaudeRequestSessionIdentity(headers http.Header, body []byte) requestSessionIdentity {
@@ -1183,6 +1184,10 @@ func SyncClaudeUsageState(store *auth.Store, account *auth.Account, resp *http.R
 	reset5h := claudeRatelimitHeaderTime(h.Get("anthropic-ratelimit-unified-5h-reset"))
 	pct7d, ok7d := claudeRatelimitHeaderPct(h.Get("anthropic-ratelimit-unified-7d-utilization"))
 	reset7d := claudeRatelimitHeaderTime(h.Get("anthropic-ratelimit-unified-7d-reset"))
+	// 7d_oi is Fable's shared weekly window. Presence matters: 0.0 is a
+	// valid observation and must produce a visible 0% model-scoped bar.
+	pctFable, okFable := claudeRatelimitHeaderPct(h.Get("anthropic-ratelimit-unified-7d_oi-utilization"))
+	resetFable := claudeRatelimitHeaderTime(h.Get("anthropic-ratelimit-unified-7d_oi-reset"))
 	observedAt := time.Now()
 	if !ok5h && !ok7d {
 		// A valid native response without quota metadata is still evidence that
@@ -1191,7 +1196,7 @@ func SyncClaudeUsageState(store *auth.Store, account *auth.Account, resp *http.R
 		account.MarkClaudeUsageObservation(observedAt)
 	}
 
-	if ok5h || ok7d {
+	if ok5h || ok7d || okFable {
 		account.ApplyUsageObservation(observedAt, func() {
 			if ok5h {
 				account.SetUsageSnapshot5hAt(pct5h, reset5h, observedAt)
@@ -1201,6 +1206,12 @@ func SyncClaudeUsageState(store *auth.Store, account *auth.Account, resp *http.R
 			}
 			if store == nil {
 				return
+			}
+			if okFable {
+				store.PersistClaudeHeaderUsage(account, []auth.ClaudeUsageWindow{{
+					Name: "7d_fable", Label: "Fable 5.x", Utilization: pctFable,
+					ResetAt: resetFable, ModelScoped: true, ModelFamily: "fable",
+				}}, observedAt)
 			}
 			if ok7d {
 				store.PersistUsageSnapshot(account, pct7d)

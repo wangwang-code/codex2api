@@ -1661,7 +1661,7 @@ func TestPrepareResponsesBody_JSONObjectInjectsJSONHintWhenInputOmitsJSON(t *tes
 	}
 }
 
-func TestPrepareOpenAIResponsesBody_JSONObjectPrefixesStringInputWhenInputOmitsJSON(t *testing.T) {
+func TestPrepareOpenAIResponsesBody_NativeJSONObjectPreservesInputWhenInputOmitsJSON(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
 		"input":"return name",
@@ -1671,8 +1671,8 @@ func TestPrepareOpenAIResponsesBody_JSONObjectPrefixesStringInputWhenInputOmitsJ
 	got := PrepareOpenAIResponsesBody(raw)
 
 	input := gjson.GetBytes(got, "input").String()
-	if !strings.Contains(strings.ToLower(input), "json") || !strings.Contains(input, "return name") {
-		t.Fatalf("expected string input to include JSON hint and original input, got %q; body=%s", input, got)
+	if input != "return name" {
+		t.Fatalf("native JSON mode must preserve the original input, got %q; body=%s", input, got)
 	}
 	if gjson.GetBytes(got, "include").Exists() {
 		t.Fatalf("OpenAI Responses body should not get Codex include defaults; body=%s", got)
@@ -2100,7 +2100,7 @@ func TestPrepareResponsesBody_PromptCompatAndTopLevelImageOptions(t *testing.T) 
 	}
 }
 
-func TestPrepareResponsesBody_InjectsImageToolWithinToolLimit(t *testing.T) {
+func TestPrepareResponsesBody_DefaultImageToolDoesNotDisplaceToolsAtCapacity(t *testing.T) {
 	tools := make([]any, maxTools)
 	for i := range tools {
 		tools[i] = map[string]any{
@@ -2128,12 +2128,10 @@ func TestPrepareResponsesBody_InjectsImageToolWithinToolLimit(t *testing.T) {
 	if len(outTools) != maxTools {
 		t.Fatalf("tools count = %d, want %d; body=%s", len(outTools), maxTools, got)
 	}
-	last := outTools[len(outTools)-1]
-	if last.Get("type").String() != "image_generation" {
-		t.Fatalf("last tool type = %q, want image_generation; body=%s", last.Get("type").String(), got)
-	}
-	if last.Get("model").String() != defaultImagesToolModel {
-		t.Fatalf("image tool model = %q, want %q; body=%s", last.Get("model").String(), defaultImagesToolModel, got)
+	for i, tool := range outTools {
+		if tool.Get("type").String() != "function" || tool.Get("name").String() != fmt.Sprintf("tool_%d", i) {
+			t.Fatalf("implicit image injection displaced a supplied tool: index=%d tool=%s", i, tool.Raw)
+		}
 	}
 }
 
@@ -4187,5 +4185,48 @@ func TestModelSupportsMaxReasoningEffort(t *testing.T) {
 	}
 	if got := normalizeConfiguredReasoningEffort("max", "gpt-daybreak-blue-latest"); got != "max" {
 		t.Fatalf("daybreak max effort clamped to %q", got)
+	}
+}
+
+func TestReasoningReplayOmitsDisplayContent(t *testing.T) {
+	var input any
+	if err := json.Unmarshal([]byte(`[{"type":"reasoning","id":"rs_probe","encrypted_content":"gAAAAnative","summary":[{"type":"summary_text","text":"visible summary"}],"content":[{"type":"reasoning_text","text":"visible summary"}],"status":"completed"},{"role":"user","content":[{"type":"input_text","text":"keep user content"}]}]`), &input); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, changed, keep := dropBareReasoningInputValue(input)
+	if !changed || !keep {
+		t.Fatal("expected cleaned reasoning history")
+	}
+	items := cleaned.([]any)
+	reasoning := items[0].(map[string]any)
+	if _, exists := reasoning["content"]; exists {
+		t.Fatal("display-only reasoning.content is still replayed")
+	}
+	if _, exists := reasoning["status"]; exists {
+		t.Fatal("status is still replayed")
+	}
+	if reasoning["encrypted_content"] != "gAAAAnative" || len(reasoning["summary"].([]any)) != 1 {
+		t.Fatal("reasoning context lost")
+	}
+	if len(items[1].(map[string]any)["content"].([]any)) != 1 {
+		t.Fatal("user content lost")
+	}
+}
+
+func TestPrepareResponsesBodyPreservesNativeAgentContext(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","input":[{"type":"agent_message","id":"amsg_native","author":"parent","recipient":"child","content":[{"type":"input_text","text":"plain task"},{"type":"encrypted_content","encrypted_content":"gAAAAnative-agent-context"}]}]}`)
+	got, _ := PrepareResponsesBody(raw)
+	for path, want := range map[string]string{
+		"input.0.type":                        "agent_message",
+		"input.0.author":                      "parent",
+		"input.0.recipient":                   "child",
+		"input.0.content.0.type":              "input_text",
+		"input.0.content.0.text":              "plain task",
+		"input.0.content.1.type":              "encrypted_content",
+		"input.0.content.1.encrypted_content": "gAAAAnative-agent-context",
+	} {
+		if value := gjson.GetBytes(got, path).String(); value != want {
+			t.Errorf("%s = %q, want %q", path, value, want)
+		}
 	}
 }

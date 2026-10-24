@@ -35,6 +35,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/internal/openaiidentity"
+	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -44,22 +45,25 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	imageQueue         *imageJobQueue
-	qualityTestContext context.Context
-	qualityTestWG      sync.WaitGroup
-	store              *auth.Store
-	modelRefreshFuncs  map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
-	proxyRiskJobsMu    sync.RWMutex
-	proxyRiskJobs      map[string]*proxyRiskScoringJob
-	cache              cache.TokenCache
-	authCacheProxy     *proxy.Handler
-	db                 *database.DB
-	cacheCfgStore      responseCacheSettingsStore
-	rateLimiter        *proxy.RateLimiter
-	systemUpdate       *systemUpdater
-	systemUpdateOnce   sync.Once
-	refreshAccount     func(context.Context, int64) error
-	probeUsage         func(context.Context, *auth.Account) error
+	intelligenceDeviceConfig *proxy.DeviceProfileConfig
+	intelligenceOnce         sync.Once
+	intelligenceWG           sync.WaitGroup
+	imageQueue               *imageJobQueue
+	qualityTestContext       context.Context
+	qualityTestWG            sync.WaitGroup
+	store                    *auth.Store
+	modelRefreshFuncs        map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	proxyRiskJobsMu          sync.RWMutex
+	proxyRiskJobs            map[string]*proxyRiskScoringJob
+	cache                    cache.TokenCache
+	authCacheProxy           *proxy.Handler
+	db                       *database.DB
+	cacheCfgStore            responseCacheSettingsStore
+	rateLimiter              *proxy.RateLimiter
+	systemUpdate             *systemUpdater
+	systemUpdateOnce         sync.Once
+	refreshAccount           func(context.Context, int64) error
+	probeUsage               func(context.Context, *auth.Account) error
 
 	codexUsageRefreshRunning atomic.Bool
 
@@ -72,6 +76,7 @@ type Handler struct {
 	activate5hWindow             func(context.Context, *auth.Account) error
 	executeUsageProbe            usageProbeRequestFunc
 	syncAccountPlanOnReset       func(context.Context, *auth.Account) error
+	queryResetUsage              func(context.Context, *auth.Account, string) (*proxy.WhamUsage, *http.Response, error)
 	queryResetCredits            func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit           func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	queryWhamDailyUsage          func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
@@ -104,11 +109,16 @@ type Handler struct {
 	cacheDriver                string
 	cacheLabel                 string
 	adminSecretEnv             string
+	adminAuthThrottle          *adminAuthThrottle
 	imageProxy                 *proxy.Handler
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
 	// Claude / Antigravity 渠道连通性测试配置的进程内缓存（首次读库，PUT 刷新）。
-	channelTestCfg atomic.Pointer[database.ChannelTestConfig]
+	channelTestCfg        atomic.Pointer[database.ChannelTestConfig]
+	channelMonitorWake    chan struct{}
+	channelMonitorSlots   chan struct{}
+	channelMonitorRunning sync.Map
+	channelMonitorID      string
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -340,6 +350,7 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	if account.GetAccessToken() == "" && !account.IsCodexAgentIdentity() {
 		return
 	}
+	defer h.refreshImportedDaybreak(ctx, accountID)
 	probeFn := h.usageProbeFunc()
 	if probeFn == nil {
 		return
@@ -416,6 +427,9 @@ const (
 	importTierRecoveryDelay   = 5 * time.Second
 	importDBWaitBackoff       = 10 * time.Second
 )
+
+// maxAdminPage 限制分页页码，避免 (page-1)*page_size 溢出为负 OFFSET。
+const maxAdminPage = 100000
 
 type importRuntimeLoadSnapshot struct {
 	RPM         int64
@@ -680,7 +694,7 @@ func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, sou
 		h.triggerImportedAccountUsageProbe(id, source)
 		return
 	}
-	if h.store != nil && !h.store.GetLazyMode() {
+	if h.store != nil {
 		h.runImportProbeTask(func(ctx context.Context) {
 			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
 		})
@@ -695,6 +709,12 @@ func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source
 	}
 	h.store.AddAccounts(accounts)
 	if skipRefresh {
+		for _, account := range accounts {
+			if account != nil && account.GetAccessToken() != "" {
+				id := account.ID()
+				h.runImportProbeTask(func(ctx context.Context) { h.refreshImportedDaybreak(ctx, id) })
+			}
+		}
 		return
 	}
 	for _, acc := range accounts {
@@ -1025,10 +1045,14 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheDriver:          tc.Driver(),
 		cacheLabel:           tc.Label(),
 		adminSecretEnv:       adminSecretEnv,
+		adminAuthThrottle:    newAdminAuthThrottle(),
 		imageProxy:           proxy.NewHandler(store, db, nil, nil),
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
 		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+		channelMonitorWake:   make(chan struct{}, 1),
+		channelMonitorSlots:  make(chan struct{}, 4),
+		channelMonitorID:     fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -1123,6 +1147,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.GET("/accounts/:id/openai-responses/balance", h.GetOpenAIResponsesBalance)
+	api.GET("/accounts/:id/channel-monitor", h.GetChannelMonitorConfig)
+	api.PUT("/accounts/:id/channel-monitor", h.UpdateChannelMonitorConfig)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
 	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
@@ -1163,6 +1189,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/grok/state", h.GetGrokAccountState)
 	api.POST("/accounts/:id/grok/sync", h.SyncGrokAccountState)
 	api.POST("/accounts/:id/grok/capabilities/probe", h.ProbeGrokAccountCapabilities)
+	api.GET("/accounts/:id/grok/auth-json", h.GetGrokAccountAuthJSON)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -1170,9 +1197,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/models", h.UpdateAccountModels)
 	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
-	api.POST("/accounts/:id/turn-state/refresh", h.RefreshCodexTurnStateTemplates)
-	api.GET("/codex-turn-state/renewals", h.ListCodexTurnStateHistory)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.GET("/channel-monitors", h.ListChannelMonitors)
+	api.GET("/channel-monitors/billing-rates", h.ListChannelMonitorBillingRates)
+	api.POST("/channel-monitors/:id/probe", h.ProbeChannelMonitorNow)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -1199,8 +1227,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/invite/plan", h.GetInviteGuidePlan)
 	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
+	api.GET("/accounts/:id/model-detector", h.DetectCodexModel)
+	api.GET("/modeltrace/bank", h.GetModelTraceBank)
+	api.POST("/modeltrace/bank/update", h.UpdateModelTraceBank)
+	api.DELETE("/modeltrace/bank", h.ResetModelTraceBank)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
+	h.registerIntelligenceCheckRoutes(api)
 	api.GET("/quality-tests", h.ListQualityTests)
 	api.GET("/quality-tests/:id", h.GetQualityTest)
 	api.POST("/quality-tests/:id/cancel", h.CancelQualityTest)
@@ -1240,6 +1273,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
+	api.GET("/keys-concurrency", h.GetAPIKeyConcurrency)
 	api.POST("/keys", h.CreateAPIKey)
 	api.POST("/keys/reset-all-quotas", h.ResetAllAPIKeyQuotas)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
@@ -1330,6 +1364,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/models/refresh-all", h.RefreshAllModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
+	api.POST("/codex-client-versions/sync", h.SyncCodexClientVersions)
 	api.GET("/model-pricing", h.ListModelPricing)
 	api.PUT("/model-pricing", h.UpdateModelPricing)
 	api.POST("/model-pricing/sync", h.SyncModelPricing)
@@ -1405,19 +1440,43 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
+		clientIP := c.ClientIP()
+		// Check the block before comparing any candidate. Accepting a correct
+		// candidate during a block would leave an unlimited password oracle.
+		if retry := h.adminAuthThrottle.retryAfter(clientIP, time.Now()); retry > 0 {
+			c.Header("Retry-After", strconv.Itoa(int((retry+time.Second-1)/time.Second)))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "认证失败次数过多，请稍后再试",
+			})
+			return
+		}
+
 		// 清理输入
 		adminKey = security.SanitizeInput(adminKey)
 
 		// 使用安全比较防止时序攻击
 		if !security.SecureCompare(adminKey, adminSecret) {
 			// 记录安全审计日志
-			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, security.SanitizeLog(clientIP), source))
+			if blocked := h.adminAuthThrottle.recordFailure(clientIP, time.Now()); blocked > 0 {
+				c.Header("Retry-After", strconv.Itoa(int((blocked+time.Second-1)/time.Second)))
+				c.JSON(http.StatusTooManyRequests, gin.H{
+					"error": "认证失败次数过多，请稍后再试",
+				})
+				c.Abort()
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
 			c.Abort()
 			return
 		}
+		h.adminAuthThrottle.reset(clientIP)
+
+		// 管理端响应包含 raw_key、auth.json、settings 等秘密，禁止中间缓存保存。
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
 
 		// 成功认证，记录审计日志
 		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
@@ -1684,6 +1743,7 @@ type accountResponse struct {
 	AvatarURL                     string                      `json:"avatar_url,omitempty"`
 	VerifiedEmail                 bool                        `json:"verified_email,omitempty"`
 	ProjectID                     string                      `json:"project_id,omitempty"`
+	AntigravityUserProjectID      string                      `json:"antigravity_user_project_id,omitempty"`
 	AntigravityQuota              json.RawMessage             `json:"antigravity_quota,omitempty"`
 	AntigravityPermissions        json.RawMessage             `json:"antigravity_permissions,omitempty"`
 	AntigravitySyncWarning        string                      `json:"antigravity_sync_warning,omitempty"`
@@ -1704,11 +1764,7 @@ type accountResponse struct {
 	ClaudeVersionPolicyOverride   string                      `json:"claude_version_policy_override,omitempty"`
 	ClaudeClientVersionOverride   string                      `json:"claude_client_version_override,omitempty"`
 	Timezone                      string                      `json:"timezone,omitempty"`
-	CodexTurnStateProxyURL        string                      `json:"codex_turn_state_proxy_url,omitempty"`
-	CodexTurnStateDisabled        bool                        `json:"codex_turn_state_disabled"`
-	CodexTurnState                string                      `json:"codex_turn_state,omitempty"`
-	CodexTurnStateModels          string                      `json:"codex_turn_state_models,omitempty"`
-	CodexTurnStateSetAt           string                      `json:"codex_turn_state_set_at,omitempty"`
+	AccountHref                   string                      `json:"account_href,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1742,6 +1798,9 @@ type accountResponse struct {
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
+	DaybreakSupported             bool                        `json:"daybreak_supported"`
+	DaybreakModels                map[string][]string         `json:"daybreak_models,omitempty"`
+	DaybreakCheckedAt             int64                       `json:"daybreak_checked_at,omitempty"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
 	CreditsValid                  bool                        `json:"credits_valid"`
 	CreditsBalance                *string                     `json:"credits_balance"`
@@ -1754,6 +1813,7 @@ type accountResponse struct {
 	AutoPause7dThreshold          *float64                    `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled           bool                        `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled           bool                        `json:"auto_pause_7d_disabled"`
+	KeepConcurrencyOnDegrade      bool                        `json:"keep_concurrency_on_degrade"`
 	UsageLimitOverride            *bool                       `json:"ignore_usage_limit_status_override"`
 	UsageLimitEffective           bool                        `json:"ignore_usage_limit_status_effective"`
 	DispatchCountLimit            *int64                      `json:"dispatch_count_limit"`
@@ -2158,6 +2218,7 @@ type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
 	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
+	KeepConcurrency         json.RawMessage `json:"keep_concurrency_on_degrade"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -2178,16 +2239,14 @@ type updateAccountSchedulerReq struct {
 	Timezone                json.RawMessage `json:"timezone"`
 	ActiveWindowStart       json.RawMessage `json:"active_window_start"`
 	ActiveWindowEnd         json.RawMessage `json:"active_window_end"`
-	CodexTurnStateProxyURL  json.RawMessage `json:"codex_turn_state_proxy_url"`
-	CodexTurnStateDisabled  json.RawMessage `json:"codex_turn_state_disabled"`
-	CodexTurnState          json.RawMessage `json:"codex_turn_state"`
-	CodexTurnStateModels    json.RawMessage `json:"codex_turn_state_models"`
+	AccountHref             json.RawMessage `json:"account_href"`
 }
 
 type accountSchedulerUpdate struct {
 	ScoreBiasOverride       database.OptionalNullInt64
 	BaseConcurrencyOverride database.OptionalNullInt64
 	SkipWarmTier            database.OptionalBool
+	KeepConcurrency         database.OptionalBool
 	AllowedAPIKeyIDs        database.OptionalInt64Slice
 	Tags                    optionalStringSlice
 	GroupIDs                database.OptionalInt64Slice
@@ -2208,13 +2267,10 @@ type accountSchedulerUpdate struct {
 	Timezone                database.OptionalString
 	// ActiveWindowStart / ActiveWindowEnd 是账号每日生效时间窗口（"HH:MM"）。
 	// 两者必须同时提供；同时留空表示清除窗口（回到全天可用）。
-	ActiveWindowStart      database.OptionalString
-	ActiveWindowEnd        database.OptionalString
-	CodexTurnStateProxyURL database.OptionalString
-	CodexTurnStateDisabled database.OptionalBool
-	CodexTurnState         database.OptionalString
-	CodexTurnStateModels   database.OptionalString
-	CredentialUpdates      map[string]interface{}
+	ActiveWindowStart database.OptionalString
+	ActiveWindowEnd   database.OptionalString
+	AccountHref       database.OptionalString
+	CredentialUpdates map[string]interface{}
 }
 
 func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
@@ -2228,6 +2284,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	keepConcurrency, err := parseOptionalBoolField(req.KeepConcurrency, auth.KeepConcurrencyOnDegradeCredentialKey)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -2346,30 +2406,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			return accountSchedulerUpdate{}, errors.New("时间窗口的起止时刻不能相同")
 		}
 	}
-	codexTurnStateProxyURL, err := parseOptionalStringField(req.CodexTurnStateProxyURL, "codex_turn_state_proxy_url", func(value string) error {
-		if value == "" {
-			return nil
-		}
-		_, err := normalizeManagedProxyURL(value)
-		return err
-	})
+	accountHref, err := parseOptionalStringField(req.AccountHref, "account_href", validateAccountHref)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
-	}
-	codexTurnStateDisabled, err := parseOptionalBoolField(req.CodexTurnStateDisabled, "codex_turn_state_disabled")
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	codexTurnStateField, err := parseOptionalStringField(req.CodexTurnState, "codex_turn_state", auth.ValidateCodexTurnState)
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	codexTurnStateModelsField, err := parseOptionalStringField(req.CodexTurnStateModels, "codex_turn_state_models", auth.ValidateCodexTurnStateModels)
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	if codexTurnStateModelsField.Set {
-		codexTurnStateModelsField.Value = auth.NormalizeCodexTurnStateModels(codexTurnStateModelsField.Value)
 	}
 	if codexFingerprintMode.Set {
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
@@ -2403,24 +2442,12 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if timezoneField.Set {
 		credentialUpdates[auth.AccountTimezoneCredentialKey] = strings.TrimSpace(timezoneField.Value)
 	}
-	if codexTurnStateProxyURL.Set {
-		credentialUpdates[auth.CodexTurnStateProxyURLCredentialKey] = codexTurnStateProxyURL.Value
-	}
-	if codexTurnStateDisabled.Set {
-		credentialUpdates[auth.CodexTurnStateDisabledCredentialKey] = codexTurnStateDisabled.Value
-	}
-	if codexTurnStateField.Set {
-		credentialUpdates[auth.CodexTurnStateCredentialKey] = codexTurnStateField.Value
-		// 时效起点默认随值一起刷新（批量接口拿不到逐账号旧值，只能按"换了新值"处理）；
-		// 单账号接口在值未变且已有起点时保留旧起点，见 refineCodexTurnStateSetAt。
-		setAt := ""
-		if codexTurnStateField.Value != "" {
-			setAt = time.Now().UTC().Format(time.RFC3339)
+	if accountHref.Set {
+		normalized, err := auth.NormalizeAccountHref(accountHref.Value)
+		if err != nil {
+			return accountSchedulerUpdate{}, err
 		}
-		credentialUpdates[auth.CodexTurnStateSetAtCredentialKey] = setAt
-	}
-	if codexTurnStateModelsField.Set {
-		credentialUpdates[auth.CodexTurnStateModelsCredentialKey] = codexTurnStateModelsField.Value
+		credentialUpdates[auth.AccountHrefCredentialKey] = normalized
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -2433,6 +2460,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}
 	if autoPause7dDisabled.Set {
 		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
+	}
+	if keepConcurrency.Set {
+		credentialUpdates[auth.KeepConcurrencyOnDegradeCredentialKey] = keepConcurrency.Value
 	}
 	if ignoreUsageLimitStatusOverride.Set {
 		if ignoreUsageLimitStatusOverride.Value == nil {
@@ -2468,6 +2498,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ScoreBiasOverride:       scoreBiasOverride,
 		BaseConcurrencyOverride: baseConcurrencyOverride,
 		SkipWarmTier:            skipWarmTier,
+		KeepConcurrency:         keepConcurrency,
 		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
 		Tags:                    tags,
 		GroupIDs:                groupIDs,
@@ -2488,10 +2519,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		Timezone:                timezoneField,
 		ActiveWindowStart:       activeWindowStart,
 		ActiveWindowEnd:         activeWindowEnd,
-		CodexTurnStateProxyURL:  codexTurnStateProxyURL,
-		CodexTurnStateDisabled:  codexTurnStateDisabled,
-		CodexTurnState:          codexTurnStateField,
-		CodexTurnStateModels:    codexTurnStateModelsField,
+		AccountHref:             accountHref,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
 }
@@ -2556,6 +2584,13 @@ func validateAccountTimezone(value string) error {
 	return nil
 }
 
+// validateAccountHref 允许空串(=清除跳转地址,回退 api-base),其余必须是
+// http/https 绝对地址;归一化在写库前由 auth.NormalizeAccountHref 完成。
+func validateAccountHref(value string) error {
+	_, err := auth.NormalizeAccountHref(value)
+	return err
+}
+
 // validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
 func validateCodexFingerprintMode(value string) error {
 	if value == "" || auth.IsValidCodexFingerprintMode(value) {
@@ -2564,28 +2599,11 @@ func validateCodexFingerprintMode(value string) error {
 	return errors.New("必须是 off、device、session、single_machine_multi_window 或 full")
 }
 
-// refineCodexTurnStateSetAt 让时效起点只在注入值真正换掉时重置：原样重提同一个值不
-// 重置（它还是上游那时候签发的那一个 state）；存量行没有起点时补一次，让倒计时能从
-// 这一刻开始走，而不是逼用户先清空再粘贴一遍。
-func refineCodexTurnStateSetAt(row *database.AccountRow, update accountSchedulerUpdate) {
-	if row == nil || !update.CodexTurnState.Set || update.CodexTurnState.Value == "" {
-		return
-	}
-	current := strings.TrimSpace(row.GetCredential(auth.CodexTurnStateCredentialKey))
-	currentSetAt := strings.TrimSpace(row.GetCredential(auth.CodexTurnStateSetAtCredentialKey))
-	if current == update.CodexTurnState.Value && currentSetAt != "" {
-		delete(update.CredentialUpdates, auth.CodexTurnStateSetAtCredentialKey)
-	}
-}
-
 func (u accountSchedulerUpdate) hasChanges() bool {
 	return u.ScoreBiasOverride.Set ||
-		u.CodexTurnStateProxyURL.Set ||
-		u.CodexTurnStateDisabled.Set ||
-		u.CodexTurnState.Set ||
-		u.CodexTurnStateModels.Set ||
 		u.BaseConcurrencyOverride.Set ||
 		u.SkipWarmTier.Set ||
+		u.KeepConcurrency.Set ||
 		u.AllowedAPIKeyIDs.Set ||
 		u.Tags.Set ||
 		u.GroupIDs.Set ||
@@ -2605,7 +2623,8 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.ClaudeClientVersion.Set ||
 		u.Timezone.Set ||
 		u.ActiveWindowStart.Set ||
-		u.ActiveWindowEnd.Set
+		u.ActiveWindowEnd.Set ||
+		u.AccountHref.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2688,18 +2707,6 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if update.CodexTurnState.Set && update.CodexTurnState.Value != "" {
-		row, err := h.db.GetAccountByID(ctx, id)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				writeError(c, http.StatusNotFound, "账号不存在")
-				return
-			}
-			writeError(c, http.StatusInternalServerError, "读取账号失败: "+err.Error())
-			return
-		}
-		refineCodexTurnStateSetAt(row, update)
-	}
 	if update.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
 		if err != nil {
@@ -2859,6 +2866,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.SkipWarmTier),
 		)
 	}
+	if update.KeepConcurrency.Set {
+		h.store.ApplyAccountKeepConcurrencyOnDegrade(id, update.KeepConcurrency.Value)
+	}
 	if update.AllowedAPIKeyIDs.Set {
 		h.store.ApplyAccountAllowedAPIKeys(id, update.AllowedAPIKeyIDs.Values)
 	}
@@ -2901,27 +2911,6 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if value, ok := update.CredentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey].(string); ok {
 		h.store.ApplyAccountUpstreamRequestIDHeader(id, value)
-	}
-	if update.CodexTurnStateProxyURL.Set {
-		h.store.ApplyAccountCodexTurnStateProxyURL(id, update.CodexTurnStateProxyURL.Value)
-	}
-	if update.CodexTurnStateDisabled.Set {
-		h.store.ApplyAccountCodexTurnStateDisabled(id, update.CodexTurnStateDisabled.Value)
-	}
-	if update.CodexTurnState.Set || update.CodexTurnStateModels.Set {
-		if account := h.store.FindByID(id); account != nil {
-			value, models, setAt := account.CodexTurnStateConfig()
-			if update.CodexTurnState.Set {
-				value = update.CodexTurnState.Value
-			}
-			if update.CodexTurnStateModels.Set {
-				models = update.CodexTurnStateModels.Value
-			}
-			if raw, ok := update.CredentialUpdates[auth.CodexTurnStateSetAtCredentialKey].(string); ok {
-				setAt = auth.ParseCodexTurnStateSetAt(raw)
-			}
-			h.store.ApplyAccountCodexTurnState(id, value, models, setAt)
-		}
 	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
@@ -4512,7 +4501,13 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
+	// 编辑已有账号时带上账号本身：号池画像按账号抽取，统一身份开关下与该账号的
+	// 对话请求取同一份身份（issue #774）；新建账号尚未落库，为空。
+	var account *auth.Account
+	if req.AccountID > 0 && h.store != nil {
+		account = h.store.FindByID(req.AccountID)
+	}
+	models, err := fetchOpenAIResponsesModelIDs(ctx, account, baseURL, req.APIKey, req.ProxyURL, customHeaders)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -4669,7 +4664,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, account *auth.Account, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := security.NewDialer(10*time.Second, 30*time.Second)
@@ -4687,7 +4682,7 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
-	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, account, baseURL, apiKey)
 	for name, value := range customHeaders {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -4863,12 +4858,17 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
+	daybreakSnapshot := account.BeginDaybreakObservation()
+	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "", nil)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
 		return
 	}
 	proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
+	if err := (proxy.DaybreakObservation{Account: account, Snapshot: daybreakSnapshot, Body: manifest.Body}).Save(ctx, h.db); err != nil {
+		writeError(c, http.StatusBadGateway, "保存 Daybreak 能力失败: "+err.Error())
+		return
+	}
 	models := auth.NormalizeAccountModels(proxy.ExtractManifestModelSlugs(manifest.Body))
 	if len(models) == 0 {
 		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
@@ -6452,9 +6452,9 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 			}
 			if value := row.GetCredential(auth.ClaudeUsageWindowsCredentialKey); value != "" {
 				resp["claude_usage_windows_probed"] = true
-				if windows := parseClaudeUsageWindows(value); len(windows) > 0 {
-					resp["claude_usage_windows"] = windows
-				}
+			}
+			if windows := claudeAccountUsageWindows(row); len(windows) > 0 {
+				resp["claude_usage_windows"] = windows
 			}
 		}
 	}
@@ -7102,6 +7102,11 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 }
 
 func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	// Antigravity 没有 Codex 式的 AT 刷新：单号/批量刷新统一走控制面同步，
+	// 同时刷新凭据、项目、权限与配额快照。
+	if h.isAntigravityAccountID(ctx, id) {
+		return h.syncAntigravityAccountByID(ctx, id)
+	}
 	return h.refreshAccountByIDWithProbe(ctx, id, true)
 }
 
@@ -7621,10 +7626,12 @@ func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
 
 // GetHealth 系统健康检查（扩展版）
 func (h *Handler) GetHealth(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, healthResponse{
-		Status:    "ok",
-		Available: h.store.AvailableCount(),
-		Total:     h.store.AccountCount(),
+		Status:       "ok",
+		Available:    h.store.AvailableCount(),
+		Total:        h.store.AccountCount(),
+		BuildVersion: version.Current(),
 	})
 }
 
@@ -8611,7 +8618,9 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 
 // ==================== API Keys ====================
 
-// ListAPIKeys 获取所有 API 密钥（脱敏版本）
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）。
+// view=lite 只返回密钥行本身,跳过窗口费用与最近使用时间:这两项要聚合 usage_logs,
+// 而筛选下拉、横幅等场景用不到,慢盘 SQLite 上每次打开页面都白扫一遍。
 func (h *Handler) ListAPIKeys(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -8619,6 +8628,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	keys, err := h.db.ListAPIKeys(ctx)
 	if err != nil {
 		writeInternalError(c, err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+		maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+		for _, k := range keys {
+			maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		}
+		c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
 		return
 	}
 
@@ -8701,10 +8718,12 @@ type createKeyReq struct {
 }
 
 // generateKey 生成随机 API Key
-func generateKey() string {
+func generateKey() (string, error) {
 	b := make([]byte, 24)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate api key: %w", err)
+	}
+	return "sk-" + hex.EncodeToString(b), nil
 }
 
 // CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
@@ -8761,7 +8780,12 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	key := req.Key
 	if key == "" {
-		key = generateKey()
+		var err error
+		key, err = generateKey()
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
 	} else {
 		// 验证用户提供的key格式
 		key = security.SanitizeInput(key)
@@ -9132,11 +9156,11 @@ func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
 }
 
 // knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的
-// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite
+// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite/promax
 // 相互独立)。未知值在 cleanPlanAllow 中被丢弃,避免把打字错误写进过滤条件后导致该
 // Key 永远选不到账号。
 var knownAPIKeyPlanFilters = map[string]struct{}{
-	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "promax": {}, "team": {}, "k12": {}, "go": {},
 	// Grok live /user.subscriptionTier values. These labels are authorization
 	// inputs only when auth.Store has a fresh live fact; JWT/archive labels never
 	// satisfy plan_allow. "api" is the explicit xAI API-key channel plan.
@@ -9336,6 +9360,7 @@ type settingsResponse struct {
 	AutoCleanError                      bool   `json:"auto_clean_error"`
 	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsOnExhaustionEnabled bool   `json:"auto_reset_credits_on_exhaustion_enabled"`
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
@@ -9354,6 +9379,7 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     int    `json:"codex_ws_downstream_keepalive_slots"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
 	GithubProxyURL                      string `json:"github_proxy_url"`
 	ProxyHealthCheckURL                 string `json:"proxy_health_check_url"`
@@ -9371,6 +9397,12 @@ type settingsResponse struct {
 	CodexCLIVersionSyncEnabled          bool   `json:"codex_cli_version_sync_enabled"`
 	CodexCLIVersionSyncIntervalHours    int    `json:"codex_cli_version_sync_interval_hours"`
 	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
+	CodexSyncedDesktopMacBuild          string `json:"codex_synced_desktop_mac_build"`
+	CodexSyncedDesktopWindowsBuild      string `json:"codex_synced_desktop_windows_build"`
+	CodexSyncedVSCodeBuild              string `json:"codex_synced_vscode_build"`
+
+	CodexClientVersions []proxy.CodexClientVersionTarget `json:"codex_client_versions"`
+
 	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
 	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
 	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
@@ -9447,9 +9479,8 @@ type settingsResponse struct {
 	CodexMinCLIVersion                 string                           `json:"codex_min_cli_version"`
 	CodexUserAgentConfig               string                           `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled              bool                             `json:"codex_telemetry_enabled"`
-	CodexTurnStateTemplateCacheEnabled bool                             `json:"codex_turn_state_template_cache_enabled"`
-	CodexTurnStateAccountMode          string                           `json:"codex_turn_state_account_mode"`
 	CodexTelemetryTimingDebug          bool                             `json:"codex_telemetry_timing_debug"`
+	CodexUnifiedClientIdentityEnabled  bool                             `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                       string                           `json:"usage_log_mode"`
 	UsageLogBatchSize                  int                              `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       int                              `json:"usage_log_flush_interval_seconds"`
@@ -9460,6 +9491,7 @@ type settingsResponse struct {
 	BillingTierPolicy                  string                           `json:"billing_tier_policy"`
 	ModelsListReadMaxBytes             int64                            `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers               bool                             `json:"show_full_usage_numbers"`
+	ShowUpstreamModelMismatch          bool                             `json:"show_upstream_model_mismatch"`
 	PublicKeyUsagePageEnabled          bool                             `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled       bool                             `json:"public_image_studio_page_enabled"`
 	PublicAccountPortalPageEnabled     bool                             `json:"public_account_portal_page_enabled"`
@@ -9490,6 +9522,7 @@ type settingsResponse struct {
 	OAuthModelCooldownMode             string                           `json:"oauth_model_cooldown_mode"`
 	OAuthModelCooldownSeconds          int                              `json:"oauth_model_cooldown_seconds"`
 	OAuthModelCooldownBackoffEnabled   bool                             `json:"oauth_model_cooldown_backoff_enabled"`
+	OAuthUnsupportedCooldownSeconds    int                              `json:"oauth_unsupported_model_cooldown_seconds"`
 }
 
 type rawJSON = json.RawMessage
@@ -9525,6 +9558,7 @@ type updateSettingsReq struct {
 	AutoCleanError                      *bool                            `json:"auto_clean_error"`
 	AutoCleanExpired                    *bool                            `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             *bool                            `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsOnExhaustionEnabled *bool                            `json:"auto_reset_credits_on_exhaustion_enabled"`
 	AutoResetCreditsBeforeExpiryMin     *int                             `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         *bool                            `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    *bool                            `json:"proxy_pool_enabled"`
@@ -9543,6 +9577,7 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int                             `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     *int                             `json:"codex_ws_downstream_keepalive_slots"`
 	GithubToken                         *string                          `json:"github_token"`
 	GithubProxyURL                      *string                          `json:"github_proxy_url"`
 	ProxyHealthCheckURL                 *string                          `json:"proxy_health_check_url"`
@@ -9619,9 +9654,8 @@ type updateSettingsReq struct {
 	CodexMinCLIVersion                  *string                          `json:"codex_min_cli_version"`
 	CodexUserAgentConfig                *string                          `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled               *bool                            `json:"codex_telemetry_enabled"`
-	CodexTurnStateTemplateCacheEnabled  *bool                            `json:"codex_turn_state_template_cache_enabled"`
-	CodexTurnStateAccountMode           *string                          `json:"codex_turn_state_account_mode"`
 	CodexTelemetryTimingDebug           *bool                            `json:"codex_telemetry_timing_debug"`
+	CodexUnifiedClientIdentityEnabled   *bool                            `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                        *string                          `json:"usage_log_mode"`
 	UsageLogBatchSize                   *int                             `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds        *int                             `json:"usage_log_flush_interval_seconds"`
@@ -9632,6 +9666,7 @@ type updateSettingsReq struct {
 	BillingTierPolicy                   *string                          `json:"billing_tier_policy"`
 	ModelsListReadMaxBytes              *int64                           `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers                *bool                            `json:"show_full_usage_numbers"`
+	ShowUpstreamModelMismatch           *bool                            `json:"show_upstream_model_mismatch"`
 	PublicKeyUsagePageEnabled           *bool                            `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled        *bool                            `json:"public_image_studio_page_enabled"`
 	PublicAccountPortalPageEnabled      *bool                            `json:"public_account_portal_page_enabled"`
@@ -9662,6 +9697,7 @@ type updateSettingsReq struct {
 	OAuthModelCooldownMode              *string                          `json:"oauth_model_cooldown_mode"`
 	OAuthModelCooldownSeconds           *int                             `json:"oauth_model_cooldown_seconds"`
 	OAuthModelCooldownBackoffEnabled    *bool                            `json:"oauth_model_cooldown_backoff_enabled"`
+	OAuthUnsupportedCooldownSeconds     *int                             `json:"oauth_unsupported_model_cooldown_seconds"`
 }
 
 func updateSettingsHasFieldsOtherThanCustomPatterns(req updateSettingsReq) bool {
@@ -10272,6 +10308,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
+	showUpstreamModelMismatch := true
 	publicKeyUsagePageEnabled := true
 	publicImageStudioPageEnabled := true
 	publicAccountPortalPageEnabled := false
@@ -10282,6 +10319,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		showUpstreamModelMismatch = dbSettings.ShowUpstreamModelMismatch
 		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 		publicImageStudioPageEnabled = dbSettings.PublicImageStudioPageEnabled
 		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
@@ -10295,12 +10333,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	autoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	autoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// uTLS 优雅关闭等待上限（issue #446）：与自动消费同款，数据库是多实例下的权威来源。
 	utlsShutdownTimeoutMinutes := runtimeCfg.UTLSShutdownTimeoutMin
 	if dbSettings != nil {
 		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		autoResetCreditsOnExhaustionEnabled = dbSettings.AutoResetCreditsOnExhaustionEnabled
 		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
 		autoActivate5hWindowEnabled = dbSettings.AutoActivate5hWindowEnabled
 		utlsShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(dbSettings.UTLSShutdownTimeoutMinutes)
@@ -10340,6 +10380,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		OAuthUnsupportedCooldownSeconds:     modelCooldownSettings.UnsupportedCooldownSeconds(),
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -10358,6 +10399,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: autoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         autoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -10376,6 +10418,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		ProxyHealthCheckURL:                 h.store.ProxyHealthCheckURL(),
@@ -10393,6 +10436,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
+		CodexClientVersions:                 proxy.CodexClientVersionCacheView(),
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -10459,9 +10506,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
-		CodexTurnStateTemplateCacheEnabled:  runtimeCfg.CodexTurnStateTemplateCache,
-		CodexTurnStateAccountMode:           runtimeCfg.CodexTurnStateAccountMode,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
@@ -10472,6 +10518,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -10630,7 +10677,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		req.RelayModelCooldownBackoffEnabled != nil ||
 		req.OAuthModelCooldownMode != nil ||
 		req.OAuthModelCooldownSeconds != nil ||
-		req.OAuthModelCooldownBackoffEnabled != nil
+		req.OAuthModelCooldownBackoffEnabled != nil ||
+		req.OAuthUnsupportedCooldownSeconds != nil
 	if req.RelayModelCooldownMode != nil && !database.IsValidModelCooldownMode(*req.RelayModelCooldownMode) {
 		writeError(c, http.StatusBadRequest, "relay_model_cooldown_mode 必须是 off、fixed 或 adaptive")
 		return
@@ -10647,6 +10695,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 必须在 1-%d 之间", field, database.MaxModelCooldownSeconds))
 			return
 		}
+	}
+	if value := req.OAuthUnsupportedCooldownSeconds; value != nil && (*value < 0 || *value > database.MaxModelCooldownSeconds) {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("oauth_unsupported_model_cooldown_seconds 必须在 0-%d 之间（0 表示关闭）", database.MaxModelCooldownSeconds))
+		return
 	}
 	var submittedPromptFilterCustomPatterns []promptfilter.PatternConfig
 	var promptFilterPatternQuarantines []promptfilter.PatternQuarantine
@@ -10766,16 +10818,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
+	showUpstreamModelMismatch := true
 	publicKeyUsagePageEnabled := true
 	publicImageStudioPageEnabled := true
 	publicAccountPortalPageEnabled := false
 	modelPricingOverrides := "{}"
 	modelPricingSyncURL := ""
 	persistedAutoResetCreditsEnabled := false
+	persistedAutoResetCreditsOnExhaustionEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedAutoActivate5hWindowEnabled := false
-	persistedCodexTurnStateTemplateCache := false
-	persistedCodexTurnStateAccountMode := proxy.CodexTurnStateAccountModeAuto
 	codexImagesMainModel := ""
 	persistedUTLSShutdownTimeoutMinutes := database.NormalizeUTLSShutdownTimeoutMinutes(0)
 	modelsListReadMaxBytes := database.DefaultModelsListReadMaxBytes
@@ -10792,16 +10844,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		showUpstreamModelMismatch = existingSettings.ShowUpstreamModelMismatch
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
 		publicImageStudioPageEnabled = existingSettings.PublicImageStudioPageEnabled
 		publicAccountPortalPageEnabled = existingSettings.PublicAccountPortalPageEnabled
 		modelPricingOverrides = existingSettings.ModelPricingOverrides
 		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedAutoResetCreditsOnExhaustionEnabled = existingSettings.AutoResetCreditsOnExhaustionEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
-		persistedCodexTurnStateTemplateCache = existingSettings.CodexTurnStateTemplateCacheEnabled
-		persistedCodexTurnStateAccountMode = proxy.NormalizeCodexTurnStateAccountMode(existingSettings.CodexTurnStateAccountMode)
 		codexImagesMainModel = existingSettings.CodexImagesMainModel
 		persistedUTLSShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(existingSettings.UTLSShutdownTimeoutMinutes)
 		modelsListReadMaxBytes = database.NormalizeModelsListReadMaxBytes(existingSettings.ModelsListReadMaxBytes)
@@ -10874,17 +10926,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	previousAutoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
 	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	previousAutoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
-	previousCodexTurnStateTemplateCache := runtimeCfg.CodexTurnStateTemplateCache
-	previousCodexTurnStateAccountMode := runtimeCfg.CodexTurnStateAccountMode
 	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
 	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
 	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.AutoResetCreditsOnExhaustionEnabled = persistedAutoResetCreditsOnExhaustionEnabled
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
-	runtimeCfg.CodexTurnStateTemplateCache = persistedCodexTurnStateTemplateCache
-	runtimeCfg.CodexTurnStateAccountMode = persistedCodexTurnStateAccountMode
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
 	runtimeCfg.ModelsListReadMaxBytes = modelsListReadMaxBytes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
@@ -10898,11 +10948,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil || req.ContinuousRetryMaxDurationSeconds != nil
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
-	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
+	autoResetCreditsChanged := (req.AutoResetCreditsOnExhaustionEnabled != nil && *req.AutoResetCreditsOnExhaustionEnabled != persistedAutoResetCreditsOnExhaustionEnabled) ||
+		(req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
 	autoActivate5hChanged := req.AutoActivate5hWindowEnabled != nil && *req.AutoActivate5hWindowEnabled != persistedAutoActivate5hWindowEnabled
-	turnStateTemplateSettingsChanged := (req.CodexTurnStateTemplateCacheEnabled != nil && *req.CodexTurnStateTemplateCacheEnabled != persistedCodexTurnStateTemplateCache) ||
-		(req.CodexTurnStateAccountMode != nil && proxy.NormalizeCodexTurnStateAccountMode(*req.CodexTurnStateAccountMode) != persistedCodexTurnStateAccountMode)
 	usageLogMode := h.db.GetUsageLogMode()
 	usageLogBatchSize := h.db.GetUsageLogBatchSize()
 	usageLogFlushIntervalSeconds := h.db.GetUsageLogFlushIntervalSeconds()
@@ -11016,7 +11065,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	if req.ProxyURL != nil {
 		h.store.SetProxyURL(*req.ProxyURL)
-		log.Printf("设置已更新: proxy_url = %s", *req.ProxyURL)
+		log.Printf("设置已更新: proxy_url = %s", security.MaskURLCredentials(*req.ProxyURL))
 	}
 
 	if req.PgMaxConns != nil {
@@ -11183,6 +11232,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
 	}
 
+	if req.CodexWSDownstreamKeepaliveSlots != nil {
+		v := database.NormalizeCodexWSDownstreamKeepaliveSlots(*req.CodexWSDownstreamKeepaliveSlots)
+		h.store.SetCodexWSDownstreamKeepaliveSlots(v)
+		runtimeCfg.CodexWSDownstreamKeepaliveSlots = v
+		log.Printf("设置已更新: codex_ws_downstream_keepalive_slots = %d", v)
+	}
+
 	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
 	if req.GithubToken != nil {
 		v := strings.TrimSpace(*req.GithubToken)
@@ -11194,7 +11250,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := strings.TrimSpace(*req.GithubProxyURL)
 		h.store.SetGithubProxyURL(v)
 		runtimeCfg.GithubProxyURL = v
-		log.Printf("设置已更新: github_proxy_url = %s", v)
+		log.Printf("设置已更新: github_proxy_url = %s", security.MaskURLCredentials(v))
 	}
 	if req.ProxyHealthCheckURL != nil {
 		// 代理检测目标会直接作为请求 URL 使用，含空白/非法 scheme/无 host 的一律拒绝，
@@ -11555,17 +11611,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexTelemetryEnabled = *req.CodexTelemetryEnabled
 		log.Printf("设置已更新: codex_telemetry_enabled = %t", runtimeCfg.CodexTelemetryEnabled)
 	}
-	if req.CodexTurnStateTemplateCacheEnabled != nil {
-		runtimeCfg.CodexTurnStateTemplateCache = *req.CodexTurnStateTemplateCacheEnabled
-		log.Printf("设置已更新: codex_turn_state_template_cache_enabled = %t", runtimeCfg.CodexTurnStateTemplateCache)
-	}
-	if req.CodexTurnStateAccountMode != nil {
-		runtimeCfg.CodexTurnStateAccountMode = proxy.NormalizeCodexTurnStateAccountMode(*req.CodexTurnStateAccountMode)
-		log.Printf("设置已更新: codex_turn_state_account_mode = %s", runtimeCfg.CodexTurnStateAccountMode)
-	}
 	if req.CodexTelemetryTimingDebug != nil {
 		runtimeCfg.CodexTelemetryTimingDebug = *req.CodexTelemetryTimingDebug
 		log.Printf("设置已更新: codex_telemetry_timing_debug = %t", runtimeCfg.CodexTelemetryTimingDebug)
+	}
+	if req.CodexUnifiedClientIdentityEnabled != nil {
+		runtimeCfg.CodexUnifiedClientIdentityEnabled = *req.CodexUnifiedClientIdentityEnabled
+		log.Printf("设置已更新: codex_unified_client_identity_enabled = %t", runtimeCfg.CodexUnifiedClientIdentityEnabled)
 	}
 	if req.StreamFlushPolicy != nil {
 		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
@@ -11590,6 +11642,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.ShowFullUsageNumbers != nil {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
+	}
+	if req.ShowUpstreamModelMismatch != nil {
+		showUpstreamModelMismatch = *req.ShowUpstreamModelMismatch
+		log.Printf("设置已更新: show_upstream_model_mismatch = %t", showUpstreamModelMismatch)
 	}
 	if req.PublicKeyUsagePageEnabled != nil {
 		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
@@ -11639,6 +11695,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetIgnoreUsageLimitStatus(*req.IgnoreUsageLimitStatus)
 		log.Printf("设置已更新: ignore_usage_limit_status = %t", *req.IgnoreUsageLimitStatus)
 	}
+	if req.AutoResetCreditsOnExhaustionEnabled != nil {
+		runtimeCfg.AutoResetCreditsOnExhaustionEnabled = *req.AutoResetCreditsOnExhaustionEnabled
+	}
 	if req.AutoResetCreditsEnabled != nil {
 		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
 		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
@@ -11657,20 +11716,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	effectiveRuntimeCfg := runtimeCfg
 	if autoResetCreditsChanged {
 		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
+		effectiveRuntimeCfg.AutoResetCreditsOnExhaustionEnabled = previousAutoResetCreditsOnExhaustionEnabled
 		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
 	}
 	if autoActivate5hChanged {
 		effectiveRuntimeCfg.AutoActivate5hWindowEnabled = previousAutoActivate5hWindowEnabled
 	}
-	if turnStateTemplateSettingsChanged {
-		// Hold back until UpdateSystemSettings succeeds (same pattern as auto-reset).
-		effectiveRuntimeCfg.CodexTurnStateTemplateCache = previousCodexTurnStateTemplateCache
-		effectiveRuntimeCfg.CodexTurnStateAccountMode = previousCodexTurnStateAccountMode
-	}
 	effectiveRuntimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
 		// 必须保留临界区内读到的最新值，避免反向回滚同步结果。
 		effectiveRuntimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+		effectiveRuntimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+		effectiveRuntimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+		effectiveRuntimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 		return effectiveRuntimeCfg
 	})
 
@@ -11914,6 +11972,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: runtimeCfg.AutoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -11932,6 +11991,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubToken:                         h.store.GithubToken(),
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		ProxyHealthCheckURL:                 h.store.ProxyHealthCheckURL(),
@@ -11949,6 +12009,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
@@ -11990,9 +12053,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
-		CodexTurnStateTemplateCacheEnabled:  runtimeCfg.CodexTurnStateTemplateCache,
-		CodexTurnStateAccountMode:           runtimeCfg.CodexTurnStateAccountMode,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12002,6 +12064,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -12053,11 +12116,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoActivate5hChanged {
 			runtimeCfg = effectiveRuntimeCfg
 			writeError(c, http.StatusInternalServerError, "保存 5h 窗口自动激活设置失败，设置未生效")
-			return
-		}
-		if turnStateTemplateSettingsChanged {
-			runtimeCfg = effectiveRuntimeCfg
-			writeError(c, http.StatusInternalServerError, "保存 turn-state 模板缓存设置失败，设置未生效")
 			return
 		}
 		if continuousRetryChanged {
@@ -12123,6 +12181,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoResetCreditsChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
@@ -12130,15 +12191,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoActivate5hChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 				return runtimeCfg
 			})
 			h.triggerAutoActivate5hScan()
-		}
-		if turnStateTemplateSettingsChanged {
-			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
-				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
-				return runtimeCfg
-			})
 		}
 		if modelsListReadLimitChanged {
 			if updateErr := h.db.UpdateModelsListReadMaxBytes(c.Request.Context(), *req.ModelsListReadMaxBytes); updateErr != nil {
@@ -12162,12 +12220,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			OAuthMode:           req.OAuthModelCooldownMode,
 			OAuthSeconds:        req.OAuthModelCooldownSeconds,
 			OAuthBackoffEnabled: req.OAuthModelCooldownBackoffEnabled,
+
+			OAuthUnsupportedSeconds: req.OAuthUnsupportedCooldownSeconds,
 		})
 		if updateErr != nil {
 			writeError(c, http.StatusInternalServerError, updateErr.Error())
 			return
 		}
+		previousUnsupported := h.store.UnsupportedModelCooldown()
 		h.store.SetModelCooldownSettings(committed)
+		// Existing cooldowns longer than the new setting would otherwise keep
+		// blocking the model after it was disabled or shortened.
+		if next := h.store.UnsupportedModelCooldown(); next < previousUnsupported {
+			if cleared := h.store.ClearModelCooldownsByReason(auth.ModelCooldownReasonUnsupported, next); cleared > 0 {
+				log.Printf("设置已更新: oauth_unsupported_model_cooldown_seconds = %d，已清除 %d 条超出新时长的模型不支持冷却", committed.UnsupportedCooldownSeconds(), cleared)
+			}
+		}
 	}
 
 	if responseCacheUpdateRequested {
@@ -12235,6 +12303,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		OAuthUnsupportedCooldownSeconds:     modelCooldownSettings.UnsupportedCooldownSeconds(),
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -12253,6 +12322,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: runtimeCfg.AutoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -12271,6 +12341,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		ProxyHealthCheckURL:                 h.store.ProxyHealthCheckURL(),
@@ -12288,6 +12359,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
+		CodexClientVersions:                 proxy.CodexClientVersionCacheView(),
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -12356,9 +12431,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
-		CodexTurnStateTemplateCacheEnabled:  runtimeCfg.CodexTurnStateTemplateCache,
-		CodexTurnStateAccountMode:           runtimeCfg.CodexTurnStateAccountMode,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12369,6 +12443,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -12853,6 +12928,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	h.addDaybreakCatalogModels(&catalog)
 	catalog.GrokModels = h.grokChannelModels()
 	catalog.AntigravityModels = h.antigravityChannelModels()
 	// The request-facing catalog must not advertise models contributed only by
@@ -12946,6 +13022,22 @@ func (h *Handler) SyncCodexCLIVersion(c *gin.Context) {
 		proxyURL = h.store.GetProxyURL()
 	}
 	result, err := proxy.SyncCodexCLIVersion(ctx, h.db, proxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// SyncCodexClientVersions 同步 CLI、Desktop 和 VSCode，并返回各来源的独立结果。
+func (h *Handler) SyncCodexClientVersions(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Minute)
+	defer cancel()
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncCodexClientVersions(ctx, h.db, proxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return

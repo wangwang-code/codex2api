@@ -2,6 +2,95 @@ export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
 export type UpstreamChannel = 'codex' | 'grok' | 'antigravity' | 'claude'
 
+export type ChannelMonitorStatus = 'unknown' | 'operational' | 'degraded' | 'failed'
+export type ChannelMonitorBillingStatus = 'unknown' | 'ok' | 'unsupported' | 'failed'
+
+export interface ChannelMonitorConfig {
+  account_id: number
+  enabled: boolean
+  interval_minutes: number
+  model: string
+  available_models: string[]
+  last_checked_at?: ISODateString
+  next_check_at?: ISODateString
+}
+
+export interface ChannelMonitorBillingData {
+  object?: string
+  schema_version?: number
+  billing_scope?: string
+  group_rate_multiplier?: number
+  user_rate_multiplier?: number
+  resolved_rate_multiplier?: number
+  peak_rate_enabled?: boolean
+  peak_start?: string
+  peak_end?: string
+  peak_rate_multiplier?: number
+  applied_peak_multiplier?: number
+  effective_rate_multiplier?: number
+  timezone?: string
+  observed_at?: ISODateString
+}
+
+export interface ChannelMonitorBillingSnapshot {
+  status: ChannelMonitorBillingStatus
+  data?: ChannelMonitorBillingData
+  message?: string
+  http_status?: number
+  checked_at?: ISODateString
+  success_at?: ISODateString
+  next_check_at?: ISODateString
+  failure_count?: number
+}
+
+export interface ChannelMonitorCheck {
+  status: ChannelMonitorStatus
+  http_status?: number
+  latency_ms: number
+  first_token_ms: number
+  checked_at: ISODateString
+}
+
+export interface ChannelMonitorCard {
+  account_id: number
+  name: string
+  base_url: string
+  model: string
+  interval_minutes: number
+  status: ChannelMonitorStatus
+  http_status?: number
+  latency_ms: number
+  first_token_ms: number
+  message?: string
+  last_checked_at?: ISODateString
+  next_check_at?: ISODateString
+  availability_7d?: number
+  checks_7d: number
+  billing: ChannelMonitorBillingSnapshot
+  recent_checks: ChannelMonitorCheck[]
+}
+
+export interface ChannelMonitorListResponse {
+  items: ChannelMonitorCard[]
+  generated_at: ISODateString
+}
+
+export interface ChannelMonitorBillingRateItem {
+  account_id: number
+  billing: ChannelMonitorBillingSnapshot
+}
+
+export interface ChannelMonitorBillingRatesResponse {
+  items: ChannelMonitorBillingRateItem[]
+  generated_at: ISODateString
+}
+
+export interface UpdateChannelMonitorConfigRequest {
+  enabled: boolean
+  interval_minutes: number
+  model: string
+}
+
 // 管理台可见渠道设置（GET/PUT /settings/visible-channels）
 export interface ChannelTestSettings {
   test_model: string
@@ -27,6 +116,7 @@ export interface AntigravityRedirectChoice {
 export interface AntigravitySettingsResponse {
   model_redirects: Record<string, string>
   redirect_overrides_effort: boolean
+  expose_thoughts: boolean
   choices: AntigravityRedirectChoice[]
 }
 
@@ -319,6 +409,7 @@ export interface AccountRow {
   grok_rate_limit?: GrokRateLimitSnapshot
   grok_free_quota?: GrokFreeQuotaSnapshot
   antigravity_project_id?: string
+  antigravity_user_project_id?: string
   antigravity_avatar_url?: string
   antigravity_verified_email?: boolean
   project_id?: string
@@ -348,16 +439,9 @@ export interface AccountRow {
   /** True once the OAuth usage probe has run for this row (even with no windows). */
   claude_usage_windows_probed?: boolean
   timezone?: string
+  /** 账号页跳转地址;空值回退打开 base_url(api-base)。 */
+  account_href?: string
   custom_headers?: Record<string, string> | null
-  codex_turn_state_status?: CodexTurnStateStatus
-  codex_turn_state_proxy_url?: string
-  codex_turn_state_disabled?: boolean
-  /** Forced X-Codex-Turn-State injected on every outbound Codex request; empty = off. */
-  codex_turn_state?: string
-  /** Comma-separated model scope for the injection; empty = all models. */
-  codex_turn_state_models?: string
-  /** RFC3339 timestamp of the last time the injected value changed; absent = unknown. */
-  codex_turn_state_set_at?: string
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -366,6 +450,7 @@ export interface AccountRow {
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
   skip_warm_tier?: boolean
+  keep_concurrency_on_degrade?: boolean
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
   tags?: string[]
@@ -408,6 +493,9 @@ export interface AccountRow {
   usage_percent_5h?: number | null
   usage_percent_spark?: number | null
   rate_limit_reset_credits?: number | null
+  daybreak_supported?: boolean
+  daybreak_models?: Record<string, string[]>
+  daybreak_checked_at?: number
   applicable_reset_credits?: number | null
   credits_valid?: boolean
   credits_balance?: string | null
@@ -541,30 +629,33 @@ export interface AccountPageStatsResponse {
   stats: Record<string, AccountPageStatsItem>
 }
 
-export type CodexTurnStatePhase = 'unknown' | 'ready' | 'healthy' | 'recovering' | 'degraded'
-
-export interface CodexTurnStateStatus {
-  injection_enabled?: boolean
-  state: CodexTurnStatePhase
-  mode: 'personal' | 'team'
-  template_length: number
-  replace_length: number
-  models: {
-    model: string
-    state: CodexTurnStatePhase
-    length: number
-    consecutive: number
-    observed_at: string
-    template_cached: boolean
-    template_expires_at?: string
-  }[]
-}
-
 export interface AccountLiveStateResponse {
   accounts: Record<string, {
-    codex_turn_state_status?: CodexTurnStateStatus
     active_requests: number
     occupied_requests: number
+    // 调度器当前实际执行的并发上限与配置值；旧后端不返回时保留列表里的值。
+    dynamic_concurrency_limit?: number
+    base_concurrency_effective?: number
+    // 运行时用量投影：旧后端缺 key 时保留列表值；显式 null 表示窗口已失效。
+    status?: AccountStatus
+    using_credits?: boolean
+    plan_type?: string
+    credits_valid?: boolean
+    credits_balance?: string | null
+    credits_has_credits?: boolean | null
+    credits_unlimited?: boolean | null
+    credits_overage_limit_reached?: boolean | null
+    credits_spend_control_reached?: boolean | null
+    credits_rate_limit_reached_type?: string | null
+    usage_percent_5h?: number | null
+    reset_5h_at?: ISODateString | null
+    codex_5h_usage_updated_at?: ISODateString | null
+    usage_percent_7d?: number | null
+    reset_7d_at?: ISODateString | null
+    codex_usage_updated_at?: ISODateString | null
+    // 最近一次被应用的 WS 配额帧；旧后端不返回，仅用于观测帧摄入。
+    codex_usage_frame_at?: ISODateString
+    codex_usage_frame_kind?: string
   }>
   session_slot_buffer_enabled: boolean
 }
@@ -612,7 +703,7 @@ export interface AccountsPageParams {
   proxyFilter?: 'all' | 'unbound' | 'this' | 'other'
   /** 订阅状态筛选(Codex 渠道),值见 SUBSCRIPTION_FILTER_OPTIONS。 */
   subscription?: SubscriptionFilter
-  sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
+  sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized' | 'id'
   order?: 'asc' | 'desc'
 }
 
@@ -1048,7 +1139,7 @@ export interface AntigravityModelQuota {
   model?: string
   model_id?: string
   name?: string
-  remaining_fraction: number
+  remaining_fraction?: number
   remaining_percent?: number
   reset_time?: string
   display_name?: string
@@ -1078,6 +1169,7 @@ export interface AntigravityQuotaGroup {
 
 export interface AntigravityQuotaSnapshot {
   models: Record<string, AntigravityModelQuota> | AntigravityModelQuota[]
+  catalog_model_ids?: string[]
   quota_groups?: AntigravityQuotaGroup[]
   groups?: AntigravityQuotaGroup[]
   subscription_tier?: string
@@ -1178,10 +1270,14 @@ export interface UpdateAntigravityAccountRequest {
   model_mapping?: string
   proxy_url?: string
   group_ids?: number[]
+  /** Caller-owned GCP project for Workspace / enterprise OAuth accounts; "" clears it. */
+  user_project_id?: string
 }
 
 export interface AntigravityImportRequest {
   files: string[]
+  /** 每项一个 Google refresh token;与 files 一起交给后端解析器。 */
+  refresh_tokens?: string[]
   proxy_url?: string
   /** 把文件内携带的代理注册进代理池（该渠道一直会采用文件内代理，开关只控制是否入表）。 */
   import_proxy?: boolean
@@ -1486,6 +1582,7 @@ export interface UpdateAccountSchedulerRequest {
   score_bias_override?: number | null
   base_concurrency_override?: number | null
   skip_warm_tier?: boolean
+  keep_concurrency_on_degrade?: boolean
   allowed_api_key_ids?: number[] | null
   proxy_url?: string | null
   tags?: string[] | null
@@ -1504,13 +1601,9 @@ export interface UpdateAccountSchedulerRequest {
   claude_version_policy?: 'passthrough' | 'fixed' | 'minimum' | null
   claude_client_version?: string | null
   timezone?: string | null
-  /** 每日生效时间窗口（24 小时制 "HH:MM"）。两者必须同时提供；同时留空表示清除窗口。 */
   active_window_start?: string | null
   active_window_end?: string | null
-  codex_turn_state_proxy_url?: string | null
-  codex_turn_state_disabled?: boolean | null
-  codex_turn_state?: string | null
-  codex_turn_state_models?: string | null
+  account_href?: string | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -1771,6 +1864,7 @@ export interface AdminErrorResponse {
 
 export interface HealthResponse {
   status: 'ok' | string
+  build_version?: string
   available: number
   total: number
 }
@@ -2091,6 +2185,7 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_on_exhaustion_enabled: boolean
   auto_reset_credits_enabled: boolean
   auto_reset_credits_before_expiry_min: number
   auto_activate_5h_window_enabled: boolean
@@ -2099,9 +2194,8 @@ export interface SystemSettings {
   scheduler_engine: 'legacy' | 'shadow' | 'indexed'
   codex_force_websocket: boolean
   codex_telemetry_enabled: boolean
-  codex_turn_state_template_cache_enabled: boolean
-  codex_turn_state_account_mode: 'personal' | 'team' | 'auto' 
   codex_telemetry_timing_debug: boolean
+  codex_unified_client_identity_enabled: boolean
   codex_request_compression: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
@@ -2114,6 +2208,7 @@ export interface SystemSettings {
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
   codex_ws_stateless_slots: number
+  codex_ws_downstream_keepalive_slots: number
   // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
   github_token?: string
   github_token_configured?: boolean
@@ -2195,6 +2290,7 @@ export interface SystemSettings {
   oauth_model_cooldown_mode: ModelCooldownMode
   oauth_model_cooldown_seconds: number
   oauth_model_cooldown_backoff_enabled: boolean
+  oauth_unsupported_model_cooldown_seconds: number
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
@@ -2232,6 +2328,11 @@ export interface SystemSettings {
   codex_cli_version_sync_enabled: boolean
   codex_cli_version_sync_interval_hours: number
   codex_synced_cli_version?: string
+  codex_synced_desktop_mac_build?: string
+  codex_synced_desktop_windows_build?: string
+  codex_synced_vscode_build?: string
+  /** 已验证的应用与内置 CLI 配对；只读，不随设置保存。 */
+  codex_client_versions?: CodexClientVersionTarget[]
   codex_effective_cli_version?: string
   codex_user_agent_config: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
@@ -2245,6 +2346,7 @@ export interface SystemSettings {
   billing_tier_policy: 'actual' | 'requested' | string
   models_list_read_max_bytes: number
   show_full_usage_numbers: boolean
+  show_upstream_model_mismatch: boolean
   public_key_usage_page_enabled: boolean
   public_image_studio_page_enabled: boolean
   public_account_portal_page_enabled: boolean
@@ -3467,9 +3569,15 @@ export interface APIKeyAccountStatsResponse {
   membership_basis: 'current_and_deleted_last_membership'
 }
 
+export type UserBillingMode = 'token' | 'per_image' | 'per_video' | 'per_second'
+
 export interface UsageLog {
-  user_billing_mode?: '' | 'token' | 'per_image'
+  /** Generated video duration (seconds) on Grok video settlement rows. */
+  video_seconds?: number
+  user_billing_mode?: '' | UserBillingMode
+  /** Unit price for unit billing modes (per image / video / second). */
   image_unit_price?: number
+  /** Billed units: images, videos or seconds depending on user_billing_mode. */
   billed_image_count?: number
   request_id?: string
   upstream_request_id?: string
@@ -3494,6 +3602,7 @@ export interface UsageLog {
   endpoint: string
   model: string
   effective_model: string
+  daybreak_program?: string
   /** 上游响应自报的模型名（未自报/历史行为空）。 */
   upstream_response_model?: string
   /** 三态：undefined/null=上游未自报无法比对；true/false=自报与实发是否一致。 */
@@ -3607,8 +3716,10 @@ export interface ChartAggregation {
 }
 
 export interface ModelPricingOverride {
-  user_billing_mode?: 'token' | 'per_image'
+  user_billing_mode?: UserBillingMode
   image_unit_price?: number
+  /** Upstream cost per media unit (USD / image or USD / second) for Grok Imagine models. */
+  media_unit_cost?: number
   image_input?: number
   cached_image_input?: number
   source?: string
@@ -3951,13 +4062,17 @@ export interface PublicAPIKeyUsageBreakdown {
 }
 
 export interface PublicAPIKeyUsageLog {
-  user_billing_mode?: '' | 'token' | 'per_image'
+  user_billing_mode?: '' | UserBillingMode
+  /** Unit price for unit billing modes (per image / video / second). */
   image_unit_price?: number
+  /** Billed units: images, videos or seconds depending on user_billing_mode. */
   billed_image_count?: number
   id: number
+  channel?: UpstreamChannel | ''
   endpoint: string
   model: string
   effective_model: string
+  daybreak_program?: string
   status_code: number
   duration_ms: number
   first_token_ms: number
@@ -3985,11 +4100,23 @@ export interface PublicAPIKeyUsageLog {
   created_at: ISODateString
 }
 
+/** Request-log filters for the public key usage page; they only narrow recent_logs. */
+export interface PublicAPIKeyUsageLogFilter {
+  model?: string
+  endpoint?: string
+  status?: '' | 'success' | 'error' | '4xx' | '5xx' | '429'
+  stream?: '' | 'stream' | 'sync'
+  channel?: '' | UpstreamChannel
+}
+
 export interface PublicAPIKeyUsageReport {
   summary: PublicAPIKeyUsageSummary
   windows: PublicAPIKeyUsageWindows
   models: PublicAPIKeyUsageBreakdown[]
   endpoints: PublicAPIKeyUsageBreakdown[]
+  /** Requested models / inbound endpoints seen in the range (unaffected by log filters). */
+  log_models?: string[]
+  log_endpoints?: string[]
   recent_logs: PublicAPIKeyUsageLog[]
   recent_logs_total: number
   recent_logs_page: number
@@ -4187,7 +4314,9 @@ export interface CodexUserAgentCatalogKind {
   default_terminal: string
   app_names: CodexUserAgentCatalogOption[] | null
   terminals: CodexUserAgentCatalogOption[] | null
+  reference_terminals?: string[] | null
   platforms: CodexUserAgentCatalogPlatform[] | null
+  reference_platforms?: CodexUserAgentCatalogPlatform[] | null
   version_pairs: CodexUserAgentCatalogVersionPair[] | null
 }
 
@@ -4202,6 +4331,41 @@ export interface CodexUserAgentPersona {
   user_agent: string
   originator: string
   version: string
+  app_version?: string
+  target_platform?: string
+  source?: string
+  status?: string
+}
+
+export interface CodexClientVersionPair {
+  app_version: string
+  cli_version: string
+  package_version?: string
+  source: string
+  artifact_url?: string
+  artifact_id?: string
+  verified_at?: number
+}
+
+export interface CodexClientVersionTarget {
+  client_kind: string
+  target_platform: string
+  status: string
+  error?: string
+  checked_at: number
+  pairs: CodexClientVersionPair[]
+}
+
+export interface CodexClientVersionSyncResult {
+  fetched_version?: string
+  synced_version?: string
+  effective_version: string
+  cli_version?: string
+  source?: string
+  status: string
+  targets?: CodexClientVersionTarget[]
+  updated: boolean
+  error?: string
 }
 
 export interface CodexUserAgentPreview {

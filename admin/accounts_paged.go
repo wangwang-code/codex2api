@@ -68,6 +68,7 @@ type accountListSnapshotItem struct {
 	PlanType            string
 	GrokAuthKind        string
 	GrokPlanCategory    string
+	AntigravityAuthKind string
 	Email               string
 	EmailDomain         string
 	Tags                []string
@@ -299,6 +300,9 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 		if err != nil || value < 1 {
 			return query, fmt.Errorf("page must be a positive integer")
 		}
+		if value > maxAdminPage {
+			return query, fmt.Errorf("page is too large")
+		}
 		query.Page = value
 	}
 	if raw := strings.TrimSpace(c.Query("page_size")); raw != "" {
@@ -331,7 +335,7 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 	validSorts := map[string]bool{
 		"": true, "requests": true, "today": true, "usage": true, "created_at": true, "updated_at": true,
 		"scheduler_priority": true, "group": true, "risk": true, "dispatch_score": true,
-		"latency_penalty": true, "unauthorized": true,
+		"latency_penalty": true, "unauthorized": true, "id": true,
 	}
 	if !validSorts[query.Sort] {
 		return query, fmt.Errorf("unsupported sort")
@@ -572,7 +576,9 @@ func isAccountListDeletePath(method, path string) bool {
 			"/api/admin/accounts/clean-rate-limited",
 			"/api/admin/accounts/clean-error",
 			"/api/admin/accounts/grok/clean-banned",
-			"/api/admin/accounts/grok/clean-error":
+			"/api/admin/accounts/grok/clean-error",
+			"/api/admin/accounts/antigravity/clean-banned",
+			"/api/admin/accounts/antigravity/clean-error":
 			return true
 		}
 		return false
@@ -725,12 +731,20 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 	if isAntigravity {
 		status, _ = antigravityPersistedStatus(row)
 	}
+	antigravityAuthKind := ""
+	if isAntigravity {
+		if strings.TrimSpace(row.GetCredential("api_key")) != "" {
+			antigravityAuthKind = auth.AntigravityAuthKindAPIKey
+		} else {
+			antigravityAuthKind = auth.AntigravityAuthKindOAuth
+		}
+	}
 	item := &accountListSnapshotItem{
 		Row: row, ID: row.ID, Status: status, CooldownReason: row.CooldownReason,
 		Enabled: row.Enabled, Locked: row.Locked, PlanType: planType, GrokAuthKind: grokAuthKind,
 		Email: email, EmailDomain: accountEmailDomain(email), Tags: append([]string(nil), row.Tags...),
 		SchedulerPriority: valueOrZero(accountSchedulerPriority(row)), OpenAIResponses: isOpenAIResponses,
-		Antigravity: isAntigravity, Claude: isClaude,
+		Antigravity: isAntigravity, AntigravityAuthKind: antigravityAuthKind, Claude: isClaude,
 		ClaudeAuthKind:      claudeAuthKindForRow(row, isClaude),
 		ClaudeUsageProbeAt:  row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey),
 		ClaudeUsageProbeErr: row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey),
@@ -785,6 +799,13 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 			}
 		}
 	}
+	if isAntigravity {
+		// Antigravity 没有 5h/7d 用量窗口；把控制面配额快照里最紧的桶折算成已用百分比，
+		// 让列表的 usage 排序与调度排序键同一口径。
+		if used, ok := auth.AntigravityQuotaUsedPercent(row.GetCredential("antigravity_quota")); ok {
+			item.UsagePercent7d, item.UsagePercent7dOK = used, true
+		}
+	}
 	if isGrok && row.GrokPlanDisplay != nil {
 		item.PlanType = row.GrokPlanDisplay.Plan
 		item.GrokPlanCategory = "other"
@@ -821,7 +842,7 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 			strings.Join(row.GetCredentialStringSlice("models"), " "), row.GetCredential("base_url"),
 			item.PlanType, item.GrokPlanCategory, row.ErrorMessage, row.ProxyURL, strings.Join(groupLabels, " "))
 	} else if isAntigravity {
-		searchParts = append(searchParts, item.PlanType, row.GetCredential("project_id"), row.GetCredential("antigravity_sync_error"), strings.Join(groupLabels, " "))
+		searchParts = append(searchParts, item.PlanType, row.GetCredential("project_id"), row.GetCredential("antigravity_sync_error"), row.ProxyURL, strings.Join(groupLabels, " "))
 	} else if isClaude {
 		searchParts = append(searchParts,
 			strings.Join(row.GetCredentialStringSlice("models"), " "), row.GetCredential("base_url"),
@@ -1128,6 +1149,11 @@ func accountListItemMatches(item *accountListSnapshotItem, query accountPageQuer
 			if item.ClaudeAuthKind != query.AuthKind {
 				return false
 			}
+		} else if channel == database.UpstreamChannelAntigravity {
+			// Antigravity 渠道:oauth=Google OAuth 凭据,api_key=Gemini API Key。
+			if item.AntigravityAuthKind != query.AuthKind {
+				return false
+			}
 		} else if item.OpenAIResponses != (query.AuthKind == auth.GrokAuthKindAPIKey) {
 			// Codex 渠道复用 auth_kind：api_key=Responses API 中转账号，oauth=官方账号（issue #522）
 			return false
@@ -1305,6 +1331,8 @@ func sortAccountListItems(items []*accountListSnapshotItem, key, order string) {
 			cmp = compareFloat64(accountListUsageValue(a), accountListUsageValue(b))
 		case "created_at":
 			cmp = compareTime(a.Row.CreatedAt, b.Row.CreatedAt)
+		case "id":
+			cmp = compareInt64(a.ID, b.ID)
 		case "updated_at":
 			cmp = compareTime(a.Row.UpdatedAt, b.Row.UpdatedAt)
 		case "scheduler_priority":
@@ -1463,6 +1491,13 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 				summary.OAuth++
 			}
 		}
+		if item.Antigravity {
+			if item.AntigravityAuthKind == auth.AntigravityAuthKindAPIKey {
+				summary.APIKey++
+			} else {
+				summary.OAuth++
+			}
+		}
 		if channel == database.UpstreamChannelCodex {
 			if item.OpenAIResponses {
 				summary.APIKey++
@@ -1547,7 +1582,7 @@ func intersectsInt64(a, b []int64) bool {
 
 func accountListSubscriptionPlan(plan string) bool {
 	switch strings.ToLower(strings.TrimSpace(plan)) {
-	case "pro", "prolite", "pro_lite", "pro-lite", "plus", "team", "teamplus", "k12", "edu", "education", "go":
+	case "pro", "prolite", "pro_lite", "pro-lite", "promax", "pro_max", "pro-max", "plus", "team", "teamplus", "k12", "edu", "edu_plus", "edu_pro", "education", "go":
 		return true
 	default:
 		return false

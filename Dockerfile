@@ -19,7 +19,7 @@ RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 # Stage 2: 构建 Go 后端
 # 使用 BUILDPLATFORM 原生运行 + TARGETARCH 交叉编译
 # ============================================================
-FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine AS go-builder
 
 ARG TARGETARCH
 ARG BUILD_VERSION=dev
@@ -47,6 +47,10 @@ FROM alpine:3.19
 RUN apk --no-cache add ca-certificates tzdata
 
 COPY --from=go-builder /codex2api /usr/local/bin/codex2api
+
+# 默认 LOG_DIR=logs 是相对路径；固定工作目录才能落到 compose 挂载的 /app/logs，
+# 否则审计日志会写到容器根目录的 /logs，容器重建后丢失。
+WORKDIR /app
 
 EXPOSE 8080
 

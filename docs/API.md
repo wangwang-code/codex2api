@@ -16,6 +16,7 @@
 - [管理 API](#管理-api)
   - [统计接口](#统计接口)
   - [账号管理](#账号管理) — 添加 RT / AT 账号、批量导入、导出、迁移
+  - [降智检测](#降智检测) — 固定账号检测、自动处置和逐次历史
   - [Claude OAuth 与原生 Messages](#claude-oauth-与原生-messages) — 导入、采样、模型与指纹配置
   - [用量统计](#用量统计)
   - [API Key 管理](#api-key-管理)
@@ -43,6 +44,23 @@ Claude 原生请求的显式会话来源依次为 `X-Claude-Code-Session-Id`、J
 出站会话头与 Claude 结构化身份中的 `session_id` 使用同一值，`device_id` 和
 `account_uuid` 则跟随实际选中账号；其他 metadata 字段及普通业务字符串 `user_id` 保留。
 system 前导块整理为计费标识、CLI 声明、其余原始块，保留原块属性及其余内容顺序。
+
+Messages→Codex 映射将工具结果中的 `tool_reference` 保留为含工具名称的 JSON 文本，
+`search_result`（用户消息或工具结果）及 `browser_state`（工具结果）也以原始 JSON 文本保留，
+避免丢失搜索来源、正文、标签页和状态变化；这些数据提供上下文，不提供 Claude 原生引用渲染。
+工具参数仍按增量发送；完成事件携带完整参数时仅补齐缺失后缀，内容冲突或非法 JSON 会明确报错。
+工具表超过现有 128 项容量时，优先保留未延迟加载、历史调用、已发现和 `tool_choice` 指定的工具，
+再按原顺序填充剩余容量；满容量时不会额外注入默认图片工具挤掉已选定义。
+必须同时保留的工具超过 128 项时明确报错，调用方需减少活跃工具
+或使用 `defer_loading`，避免静默截断所需定义。Grok 路径继续使用其原有工具表处理。
+
+Messages→Codex 的服务端 `web_search` 使用官方 Codex `/alpha/search`，复用当前账号、
+出口和客户端身份；搜索由网关执行，结果交回模型生成回答，并转换为配对的
+`server_tool_use` / `web_search_tool_result`。不切换第三方搜索服务。流式与非流式请求
+均支持，并累计搜索前后模型请求的实际 token 用量。支持 `allowed_domains`，遵守
+`max_uses`，每个请求最多执行 8 次搜索；耗尽后移除搜索工具，让模型基于已有结果回答。
+目前独立搜索适配不支持 `user_location` 和 `blocked_domains`，显式设置时返回错误，
+避免静默忽略限制。OpenAI Responses 中转账号继续转发原有 hosted `web_search`。
 
 用量日志 API 的 Claude `input_tokens` 使用包含缓存读写的总输入口径，供统一统计和计费。
 管理后台明细中的 `↓` 则显示未缓存输入（总输入减去缓存读取及 5 分钟／1 小时缓存写入），
@@ -190,7 +208,11 @@ Messages 的 `tool_use.input` 必须使用对象，因此自由文本工具输�
 
 **端点:** `POST /v1/responses`
 
-**说明:** Codex 原生 Responses 接口，直接透传，无需协议翻译。
+**说明:** Codex Responses 兼容接口。网关会为 Codex 上游做必要的输入规范化；这不是对官方 Responses 全部字段的无条件原样透传。
+
+完整的分阶段边界与后续实现顺序见 [Responses 兼容性说明](RESPONSES_COMPATIBILITY.md)。
+
+默认模式保持现有兼容行为。若客户端需要检查已知有损转换，可发送 `X-Codex2API-Strict-Compatibility: true`，或设置 `CODEX_STRICT_RESPONSES_COMPAT=true`。网关按实际选中的原生 Codex 账号检查字段及 schema，无法保留时，尚未提交的 HTTP 请求返回 `400 unsupported_feature` 和字段列表，已提交的 SSE 返回 `response.failed`，WebSocket 返回 `status:400` 错误帧；Responses 中转不受 Codex 专用限制。`background:false/null` 等空操作可通过，`background:true`、非空 `conversation` 和 `store:true` 会拒绝；reasoning、格式别名、服务档位按实际转换语义校验。工具或输出 schema 约束会被清洗改变时同样拒绝。完整范围与限制见 [Responses 兼容性说明](RESPONSES_COMPATIBILITY.md)。
 
 **请求示例:**
 
@@ -222,14 +244,14 @@ Messages 的 `tool_use.input` 必须使用对象，因此自由文本工具输�
 | include              | array        | 否   | 包含的额外字段                                                                                     |
 | previous_response_id | string       | 否   | 上一响应 ID，用于上下文连续                                                                        |
 
-`previous_response_id` 的上下文先查当前进程的有界 L1。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式没有共享 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 response_context_unavailable`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的 relay-style 后备，网关可保留原始 `previous_response_id` 继续转发，而不是立即返回上述错误。客户端原生 Responses WebSocket 入口在上游连接正常时保留 `previous_response_id` 并只发送当轮增量，轮次开始时保留仍有效的 L1 祖先引用，快照合并与序列化在响应成功提交后才执行并写入本地缓存，共享后端（Redis）写入在后台完成，不占首字路径。缓存会收集 `response.output_item.done`，因此最终 `response.output` 为空时也能保留消息、`phase`、工具调用/结果及 Lite `additional_tools` 声明。`response.completed` 和 `response.incomplete` 成功提交后均可写入，仍受写入策略、TTL 和容量限制约束；按需写入模式下，`store` 未显式为 `false` 的 WebSocket 会话从根轮起即有写入资格；显式 `store:false` 的会话（如 Codex CLI 全量上下文）不写缓存，其历史无法事后恢复。续链失效、换号或转为 HTTP 时，只有能够恢复所需上下文才继续发送；缺失、超限或不可移植的加密状态返回 `response_context_unavailable` 错误帧，共享后端故障返回 `service_unavailable`，随后关闭连接（409 使用 1008，后端暂时不可用使用 1011）。客户端应重发完整上下文并开始新的响应链。
-祖先在轮次开始前已过期或被淘汰时，网关不会把增量伪装成完整快照；该链后续健康轮也不能自行补全历史。缓存 TTL 为 10 分钟，Memory 模式重启会丢失缓存。设置环境变量 `CODEX_WS_CONTINUATION_FAIL_OPEN=true` 可退回旧行为：上下文不可恢复时剥离 `previous_response_id` 后按原样转发，上游将看不到历史；这次有损降级产生的响应不写回放缓存，关闭逃生阀后也不会信任残缺快照。
+`previous_response_id` 的上下文先查当前进程的有界 L1。本地与 Redis 共享上下文的默认绝对 TTL 为 45 分钟，覆盖聊天上游连接 30 分钟空闲回收后的恢复窗口，仍受缓存容量和账号兼容性限制。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式没有共享 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 response_context_unavailable`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的原生 OpenAI Responses relay 后备，网关可保留原始 `previous_response_id` 交给其上游恢复；其他仅做协议翻译的账号不具备这一后备能力。原生 Codex HTTP 的每个非空父引用都要求当前归属的本地或共享快照证明；普通文本父轮不新增 HTTP 会话存储，应重发完整历史并省略父 ID。重叠工具历史仅在能证明完整父前缀重放时去重，否则返回 409。客户端原生 Responses WebSocket 入口在上游连接正常时保留 `previous_response_id` 并只发送当轮增量，轮次开始时保留仍有效的 L1 祖先引用，快照合并与序列化在响应成功提交后才执行并写入本地缓存，共享后端（Redis）写入在后台完成，不占首字路径。缓存会收集 `response.output_item.done`，因此最终 `response.output` 为空时也能保留消息、`phase`、工具调用/结果及 Lite `additional_tools` 声明。`response.completed` 和 `response.incomplete` 成功提交后均可写入，仍受写入策略、TTL 和容量限制约束；按需写入模式下，`store` 未显式为 `false` 的 WebSocket 会话从根轮起即有写入资格；显式 `store:false` 的原生 WS 会话（如 Codex CLI）使用隔离的完整快照及共享后端恢复，不表示网关完全不缓存历史；仍受 TTL、容量和完整性限制。续链失效、换号或转为 HTTP 时，只有能够恢复所需上下文才继续发送；缺失、超限或不可移植的加密状态返回 `response_context_unavailable` 错误帧，共享后端故障返回 `service_unavailable`，此类恢复失败终止本轮并返回错误帧，命名流附带 `stream_id`；连接仍可接收新的完整上下文请求。协议、鉴权或连接资源错误仍可关闭连接。客户端应重发完整上下文并开始新的响应链。
+祖先在轮次开始前已过期或被淘汰时，网关不会把增量伪装成完整快照；该链后续健康轮也不能自行补全历史。缓存 TTL 为 45 分钟，Memory 模式重启会丢失缓存。设置环境变量 `CODEX_WS_CONTINUATION_FAIL_OPEN=true` 可退回旧行为：上下文不可恢复时剥离 `previous_response_id` 后按原样转发，上游将看不到历史；这次有损降级产生的响应不写回放缓存，关闭逃生阀后也不会信任残缺快照。
 
 对于原生 WebSocket 的结构化输出，`gpt-6-astra` 和 `gpt-5.6-luna` 在显式启用 Responses Lite 时保留 JSON Schema 的 `minLength` / `maxLength`。Lite 信号可来自 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite=true`、`X-OpenAI-Internal-Codex-Responses-Lite: true` 请求头，或由 Payload Rules 注入该元数据标记。该放行仅用于结构化输出；已有工具参数清洗继续使用保守规则。长度约束在入口准备阶段暂时保留，最终出站前才根据最终模型、规则改写后的 Lite 信号、账号 Lite 能力和实际传输统一处理。其他模型、最终未启用 Lite、HTTP 和 Compact 请求沿用原有清洗策略，HTTP 降级请求不会携带不适用的约束。
 
 OpenAI Responses 中转账号默认仍用 HTTP POST `/v1/responses`。账号设置 `responses_upstream_transport=websocket` 后，这个账号的 Responses 出站改为 WebSocket：地址由 Base URL 换成 `ws`/`wss`，路径仍是 `/v1/responses`，握手使用该账号的 API Key 和 `OpenAI-Beta: responses_websockets=2026-02-06`，上行帧为 `response.create`。这个开关只作用于 OpenAI Responses 中转账号，和全局 `codex_force_websocket` 无关；Grok、Antigravity、Claude 不会走这条连接。握手失败返回上游状态或传输错误，不会改回 HTTP。生图请求仍走 HTTP。连接按账号、Base URL 和 API Key 隔离；带 `previous_response_id` 时优先复用产出该响应的连接。客户端 `GET /v1/responses` 也会选中已打开该开关的中转账号。
 
-原生 WebSocket 入口为 `GET /v1/responses`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。`stream_id` 是抢占键的一部分，因此多路复用的不同流互不影响；不同 API Key 或不同路由作用域也不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。
+原生 WebSocket 入口为 `GET /v1/responses`。客户端每轮发送 `response.create`；当前网关明确拒绝 `response.append` 和官方 GPT-6 `response.steer`，返回 `status:400` 的 `unsupported_feature` WebSocket 错误帧，不会伪装成已完成的 steer。需要中途改向时，应等待当前轮结束后用 `previous_response_id` 发起新的 `response.create`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。相同 `stream_id`（含缺省流）内 FIFO，不同独立流可并行；每连接最多 16 个活动轮次、32 个命名流。每个 API Key 最多保留 64 条并发下游 WebSocket 连接，全局 4096 条；显式启用匿名访问时，匿名连接另按 IP 限制 16 条，超出返回 `503` 和 `Retry-After: 5`。命名流事件和请求级错误带回 `stream_id`，命名流请求错误或抢占不会关闭其他健康流，缺省流保留原有协议错误关闭行为。上游连接池按流隔离；同一客户端连接可从另一流已提交的 `store:false` 响应分叉，仍须命中完整缓存并满足授权范围，且指向同一父响应时仍可能等待上游原连接租约。不同 API Key 或不同路由作用域不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。
 
 **响应示例:**
 
@@ -534,7 +556,7 @@ curl 'https://your-host/v1/images/jobs/42/result' \
 }
 ```
 
-池内存在 Grok 账号时会一并列出其文本模型（如 `grok-4.7`）与媒体模型（`grok-imagine-*`）。媒体模型与账号的文本模型白名单相互独立：白名单只声明文本模型不会关闭媒体能力；白名单里显式写了 `grok-imagine` 条目时以声明为准收窄。
+池内存在 Grok 账号时会一并列出其文本模型（如 `grok-4.7`、`grok-4.7-fast`）与媒体模型（`grok-imagine-*`）。`grok-4.7-fast` 是对外名字，转发到上游时改成 `grok-4.7-build-fast`。媒体模型与账号的文本模型列表相互独立：模型列表只写了文本模型不会关闭媒体能力；模型列表里写了 `grok-imagine` 条目时，只开放列表里的媒体模型。文本模型列表如果写了，也要包含 `grok-4.7-fast` 才会暴露这个名字。目录里有 `grok-4.7` 不会把 `grok-4.7-fast` 加进已保存的模型列表。
 
 #### Grok 的 GPT 兼容别名
 
@@ -616,6 +638,34 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
   "total": 10
 }
 ```
+
+### 降智检测
+
+管理页面为 `/admin/intelligence-check`。接口沿用 Admin Secret 鉴权；完整配置、
+判定及自动处置说明见 [降智检测](INTELLIGENCE_CHECK.md)。
+
+| 方法 | 路径 | 请求与响应 |
+| --- | --- | --- |
+| GET | `/api/admin/intelligence-check/settings` | 返回当前配置和题库，含 `revision` |
+| PUT | `/api/admin/intelligence-check/settings` | 提交完整配置及读取到的 `revision`；返回新配置，版本冲突为 409 |
+| GET | `/api/admin/intelligence-check/accounts` | 分页账号状态；支持 `account_id`、`search`、`channel`、`status` 筛选 |
+| PATCH | `/api/admin/intelligence-check/accounts` | `{ "account_ids": [1], "enabled": true }`，返回 `{ "updated": 1 }` |
+| POST | `/api/admin/intelligence-check/runs` | `{ "account_ids": [1] }`，返回 202 和 `{ "runs": [...] }`；同账号已有活动任务时复用 |
+| GET | `/api/admin/intelligence-check/runs` | 分页历史；支持与账号列表相同的筛选参数 |
+| GET | `/api/admin/intelligence-check/runs/:id` | 返回 `{ "run": {...} }`，不存在为 404 |
+| GET | `/api/admin/intelligence-check/bars?account_ids=1,2` | 返回 `{ "bars": { "1": {...}, "2": {...} } }` |
+
+分页使用 `page`（默认 1）和 `page_size`（默认 20，最多 100），响应为
+`{ "items": [...], "total": 0, "page": 1, "page_size": 20 }`。
+账号开关及手动检测每次最多提交 200 个账号，状态条每次最多读取 500 个账号。
+`channel` 使用 `codex` 或 `claude`。任务 `status` 为 `queued`、`running`、
+`normal`、`degraded`、`error`、`interrupted`；未检测账号的 `latest_status` 为 `unknown`。
+
+任务详情包含配置版本、题目快照、请求及响应模型、推理强度、判定模式、最终输出、
+耗时、token 用量、错误、发起来源及自动处置。`source` 为 `manual` 或 `automatic`，
+时间使用 RFC3339。状态条只返回最近 20 条终态摘要及 `enabled`、`quality_paused`、
+`action`，存在运行中或当前可执行的排队任务时附带 `active_run_id` 和 `active_status`。
+关闭自动检测后，不可执行的自动排队任务不占用按钮的活动状态，仍可提交手动检测。
 
 ### 账号管理
 
@@ -741,6 +791,70 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 | billed_5h                  | number/null  | 过去 5 小时窗口内的累计计费金额（USD）                            |
 | billed_7d                  | number/null  | 过去 7 天窗口内的累计计费金额（USD）                              |
 
+#### GET /api/admin/accounts/live
+
+返回当前页账号的运行时并发计数与用量投影，供账号页约每秒一次的轻量轮询。只读取内存状态，不查数据库、不重建调度快照。
+
+**请求参数:**
+
+| 参数 | 类型   | 说明                               |
+| ---- | ------ | ---------------------------------- |
+| ids  | string | 逗号分隔的账号 ID，最多 500 个     |
+
+**响应:**
+
+```json
+{
+  "accounts": {
+    "1": {
+      "active_requests": 1,
+      "occupied_requests": 1,
+      "dynamic_concurrency_limit": 2,
+      "base_concurrency_effective": 2,
+      "status": "quota_paused",
+      "using_credits": false,
+      "plan_type": "pro",
+      "credits_valid": true,
+      "credits_balance": "12.5",
+      "credits_has_credits": true,
+      "credits_unlimited": false,
+      "credits_overage_limit_reached": false,
+      "credits_spend_control_reached": null,
+      "credits_rate_limit_reached_type": "",
+      "usage_percent_5h": 91.2,
+      "reset_5h_at": "2026-10-18T18:00:00+08:00",
+      "codex_5h_usage_updated_at": "2026-10-18T15:10:00+08:00",
+      "usage_percent_7d": 42,
+      "reset_7d_at": "2026-10-25T07:00:00+08:00",
+      "codex_usage_updated_at": "2026-10-18T15:10:00+08:00",
+      "codex_usage_frame_at": "2026-10-18T15:10:00+08:00",
+      "codex_usage_frame_kind": "codex.rate_limits"
+    }
+  },
+  "session_slot_buffer_enabled": false
+}
+```
+
+**字段说明:**
+
+| 字段 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| status / using_credits | string / bool | 运行时状态；旧后端或 Antigravity 行省略该 key，前端保留列表值 |
+| plan_type | string | 最新运行时套餐，沿用账号列表字段；旧后端或 Antigravity 行省略时保留列表值 |
+| credits_valid / credits_balance | bool / string/null | 当前积分快照是否已观测、余额；未知或隐藏的余额为 `null`，清除旧显示值 |
+| credits_has_credits / credits_unlimited / credits_overage_limit_reached | bool/null | 沿用账号列表的积分业务标志；未观测快照时为 `null` |
+| credits_spend_control_reached / credits_rate_limit_reached_type | bool/null / string | 支出限制与工作区硬停止；未知支出限制为 `null`，无硬停止为 `""` |
+| usage_percent_5h / usage_percent_7d | number/null | 运行时用量；显式 `null` 表示窗口已失效，前端清除列表值 |
+| reset_5h_at / reset_7d_at | string/null | 窗口重置时间（RFC3339） |
+| codex_5h_usage_updated_at / codex_usage_updated_at | string/null | 最近一次用量刷新时间；WS 每轮配额帧也会刷新 |
+| codex_usage_frame_at / codex_usage_frame_kind | string | 最近一次被应用的 WS 配额帧时间与事件类型；首帧前省略，可用于确认帧摄入是否生效 |
+| dynamic_concurrency_limit / base_concurrency_effective | integer | 调度器当前生效的并发上限与配置值 |
+| session_slot_buffer_enabled | bool | 全局会话槽缓冲开关 |
+
+缺失的 key 表示旧后端，前端保留列表值；用量字段显式 `null` 表示窗口失效。套餐与 credits 的 live 字段只投影到使用 Codex 运行时字段的行，Antigravity 行省略这些字段，不改变原列表展示。
+
+终态后到达的连接级配额帧也会更新上述字段。只有通过观测排序门的帧才推进帧时间、credits 和用量；遇到并发观测锁争用时按原始时间排队应用，不等待数据库。用量、credits、套餐与冷却的数据库写入在后台合并执行，因此 live 结果可先于持久化结果可见。
+
 #### PATCH /api/admin/accounts/:id/scheduler
 
 更新账号调度配置。
@@ -774,10 +888,6 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 | base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，`≥1` 无上限，`null` 表示恢复全局默认                                                      |
 | skip_warm_tier            | boolean/null   | 否   | 是否跳过 warm 层级；`null` 等同 `false`，字段省略时保持原值                                                |
 | allowed_api_key_ids       | integer[]/null | 否   | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
-| codex_turn_state_disabled | boolean        | 否   | `true` 关闭账号的自动与手动 Turn-State 注入；保留已有配置和模板，形态观测继续工作。默认 `false`，跟随全局模板开关 |
-| codex_turn_state_proxy_url | string/null    | 否   | 模板获取、验证和首次后台续签使用的独立代理 URL；空或 `null` 沿用账号默认出口。普通业务请求不受影响 |
-| codex_turn_state          | string/null    | 否   | 凭据级强制注入的 `X-Codex-Turn-State`：非空时该账号每个出站 Codex 请求（HTTP 头与 WebSocket 帧体 `client_metadata` 都覆盖）都强制携带该值，优先于客户端回带值与自定义请求头；只接受单行 ASCII 可见字符，最长 4096 字节；`null` 或空串表示关闭。换成新值时会重置 `codex_turn_state_set_at`（时效起点，实测约 1 小时失效），原样重提同一个值不重置，存量值没有起点时补一次 |
-| codex_turn_state_models   | string/null    | 否   | 把上述注入限定在指定模型：逗号分隔，大小写不敏感，结尾 `*` 做前缀匹配，客户端模型与上游模型任一命中即注入；空表示不限模型；识别不出模型名的请求照常注入 |
 
 **响应:**
 
@@ -871,7 +981,7 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 
 #### POST /api/admin/accounts/grok/batch-models
 
-批量替换 Grok 账号的模型白名单。`ids` 会自动去重；非 Grok 或不存在的账号计入 `failed`，不中断整批。空数组表示清空显式白名单，之后按账号可见目录或首次同步前的保守默认模型集准入。
+批量替换 Grok 账号的模型列表。`ids` 会自动去重；非 Grok 或不存在的账号计入 `failed`，不中断整批。空数组表示清空模型列表，之后按账号可见目录或首次同步前的默认模型列表准入。
 
 **请求:**
 
@@ -885,7 +995,7 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 | 参数 | 类型 | 必填 | 说明 |
 | ---- | ---- | ---- | ---- |
 | ids | integer[] | 是 | 要更新的 Grok 账号 ID |
-| models | string[] | 否 | 替换后的模型白名单；省略或空数组表示清空显式白名单并恢复目录/默认集准入 |
+| models | string[] | 否 | 替换后的模型列表；省略或空数组表示清空模型列表并恢复目录/默认集准入 |
 
 **响应:**
 
@@ -915,20 +1025,6 @@ Codex 的流式 remote compact v2（`POST /v1/responses`，`stream:true`，`inpu
 并发数遵循 `usage_probe_concurrency`，单个查询最多 15 秒。同一实例正在执行
 此批量操作时，再次调用返回 409；客户端断开后取消查询和待处理任务。完成事件
 发出前会使账号列表与分析缓存失效，随后读取即可更新用量进度条。
-
-#### 获取 Turn-State 模板
-
-`POST /api/admin/accounts/:id/turn-state/refresh` 使用管理员认证，返回 SSE 进度。仅支持运行时 Codex 原生账号，要求全局模板缓存开启且账号未关闭注入。已有同账号获取/续签任务时返回 409。
-
-事件依次为 `start`（`models`）、每模型的 `testing`（`model`）与 `result`（`result.model/saved/error`），最后为 `done`（`saved/total/status`）。每模型先获取候选，再携带候选完成验证，才保存模板；响应不包含模板正文。未重新签发时保持候选原始签发时间，不延长 TTL。具体模型范围与后台续签策略见 [配置说明](CONFIGURATION.md#turn-state-模板生命周期)。
-
-#### 查询 Turn-State 续签记录
-
-`GET /api/admin/codex-turn-state/renewals` 使用管理员认证。参数：`page`（默认 1）、`page_size`（默认 20、最大 50）、`account_id`、`plan`、`model`、`status`、`proxy_url`。`status` 为 `running/success/failed/interrupted`，筛选条件组合生效。
-
-响应包含 `records`、匹配记录数 `total` 和筛选选项 `facets`。每条记录提供账号/模型快照、`attempt/max_attempts`、代理 ID/名称/脱敏 URL/最近检测 IP、`started_at/finished_at/duration_ms`、状态、结果原因和 `expires_before/expires_after`。时间戳为 Unix 毫秒；URL 去除认证、路径及查询参数，不返回模板或访问令牌。代理 IP 是节点最近检测值，不是当次请求实时测量。
-
-该记录只覆盖后台临期续签，不回填旧结果，也不记录手动首次获取。账号 live 接口会附带 `codex_turn_state_status`，仅含近期形态、模型状态和模板有效期，不包含模板正文。
 
 ### Claude 凭据与原生 Messages
 
@@ -1738,9 +1834,11 @@ HTTP `/v1/*` 响应的 `X-Codex2API-Request-ID` 对应下方可检索的 `reques
 }
 ```
 
-`injected_turn_state` / `upstream_turn_state` 是本次尝试实际注入到出站请求上的、以及上游响应
-回带的 `X-Codex-Turn-State`（HTTP 取响应头，WebSocket 取流内 metadata 帧），空串表示没有；
-注入配置见 `PATCH /api/admin/accounts/:id/scheduler` 的 `codex_turn_state`。
+`upstream_turn_state` 是上游响应回带的 `X-Codex-Turn-State`（HTTP 取响应头，WebSocket 取流内 metadata 帧），空串表示没有。`injected_turn_state` 与 `turn_state_overridden` 只保留给更早版本写入的用量记录。
+
+`first_token_ms` 对 Responses 上游使用宽松口径：从本次上游尝试开始，到 `response.created` / `response.in_progress` 之外的首个非终态响应事件，包含没有可见文本的结构帧。它不是首个正文字符的时间，也不包含尝试开始前的入站处理和调度等待，不能直接与客户端会话日志推算的首字时间比较。
+
+`ws_acquire_ms` 包含 WebSocket 取连的排队、探活和握手耗时。默认计入 `first_token_ms`；开启 `first_token_excludes_ws_acquire` 后，两列相加可恢复含取连的首响应时间。`output_tokens` 包含推理等不可见输出，比较正文显示速度时还需核对 `reasoning_tokens`、推理强度和实际首个内容帧的时间，不能只用不同来源的平均首字值归因。
 
 #### GET /api/admin/usage/chart-data
 
@@ -2040,6 +2138,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "continuous_retry_error_codes": [],
   "continuous_retry_max_duration_seconds": 600,
   "codex_fingerprint_default_mode": "off",
+  "codex_unified_client_identity_enabled": false,
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -2086,6 +2185,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 **响应:** 更新后的完整设置对象
 
 `codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
+
+`codex_unified_client_identity_enabled`（默认 `false`）控制网关自发的 Codex 维护请求是否与对话请求使用同一份客户端身份。开启后，wham 用量查询、重置券查询与消耗、每日用量、token 明细、订阅同步（Codex 形态）、模型清单（含下游透传）以及 OpenAI Responses 中转账号的模型发现，都改用与对话出站相同的解析：按 `codex_user_agent_config` 生成（号池模式按账号抽取画像），`Originator` 跟随生成的 UA，最后套用账号自定义头里的 `User-Agent` / `Originator` / `Version`。模型清单的 `client_version` 查询参数、`Version` 头与 UA 版本段取同一版本；中转账号的 installation id 改为按中转凭据派生，对话请求体与模型发现请求头取同一值。维护请求不会新增原本不发送的头（例如 wham 探针不补 `Version` 或 `X-Codex-Installation-Id`）。订阅同步被挑战时的浏览器形态回退、邀请接口与外部版本/指纹库同步不受影响。配置身份解析失败（如 `auto` 模式下版本低于最低要求）时回退内置 `codex-tui` 身份并限频记日志。该开关不改变对话请求的身份选择：`client_compat_mode` 不是 `force` 时，官方 Codex 客户端的对话请求仍透传其自身 UA，要让账号对上游只呈现一份身份需同时使用 `force`。
 
 `max_retries`、`max_rate_limit_retries` 与 `codex_ws_silent_max_retries` 是原有的有限重试预算，管理界面和 API 范围均为 `0` 到 `10`（`0` 禁用对应预算）。需要持续重试时使用独立的 `continuous_retry_enabled` 开关；它不会改变这些有限预算的含义。开关打开后，可在 `continuous_retry_categories` 选择 `transport`、`http_429`、`http_4xx`、`http_5xx`、`stream_error`、`response_failed`、`context_error`，并用 `continuous_retry_status_codes`（例如 `[403,404,501]`）或 `continuous_retry_error_codes`（例如 `["rate_limited","context_length_exceeded"]`）精确追加匹配。类别、状态码、错误代码任一命中即可进入持续重试；403、404、上下文错误及“全部 `response.failed`”默认不选中（501 已由默认的 `http_5xx` 类别覆盖）。普通自选模式不会把结构化安全策略拒绝升级为无限重试。永久额度/余额错误（如 `insufficient_quota`、`quota_exceeded`、`billing_hard_limit`、`billing_limit_reached`、`spend_limit`、`credit_balance`、`insufficient_balance`、`usage_limited`）不会因为通用类别进入无限循环；只有管理员明确选择对应额度错误代码，或明确启用下述超级开关时，才会进入持续重试。
 
@@ -2724,6 +2825,26 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 - `global_rpm = 0`: 无限流
 - `global_rpm > 0`: 启用 RPM 限流
 
+### API Key 级窗口限额
+
+`limits.rpm`、`limits.rpd` 以及 cost/token 窗口在每次请求转发前检查。同一进程内另有原子准入计数；RPM 使用秒桶，RPD 使用滑动 24 小时计数。同一分钟内的 RPD 准入合并，在该桶最后一次准入满 24 小时后过期，因此最多保守多保留不到一分钟，不会提前释放额度。多实例部署时计数按副本独立，重启也会丢失进程内记录；持久历史检查仍依赖用量日志。准入表最多保留 8,192 个 Key；满表且没有可过期记录时，新 Key 返回 `503`，不会通过淘汰活跃计数来重置额度。
+
+批量生图在入队时只检查边界，不预留 RPM/RPD；每个实际图片调用各占一次准入。`202` 只代表任务已接收，执行时仍可能因额度不足失败，客户端必须检查任务终态。
+
+Responses（含直接 `/v1/responses/compact`）的 `input` 超过 20,000 条时在解析和改写前返回 `400`；Chat Completions 的 `messages` 保持已有 4,096 条校验上限，另有解析前守卫。两个字段的重复顶层键、大小写冲突或非规范拼写（如 `Messages`）均返回 `400`，避免前置检查与后续 JSON 解码选择不同字段。
+
+Image Studio 的管理端、门户和外部任务入口对显式 `WIDTHxHEIGHT` 限制为单边 16,384 像素、总像素 4,000 万；非法或超限目标在入队、外链下载及上游调用前返回 `400`，不会静默取消精确缩放。
+
+管理端按客户端 IP 记录认证失败：10 分钟内 5 次失败后阻断 10 分钟，并返回 `429` 与 `Retry-After`。阻断在密钥比较前执行，因此期间正确密钥也会收到 `429`，共享出口的管理员需等待阻断过期。只有明确配置的可信反向代理才能提供可信客户端地址；不要把任意客户端提供的转发头视为身份。
+
+认证失败表最多记录 4,096 个来源，保留有效的失败计数和封禁。满表且无过期条目时，未跟踪的新来源在密钥比较前收到 `429`，`Retry-After` 指向最早可释放的条目；已跟踪来源继续使用自己的计数和封禁，成功认证仍可清除该来源记录。
+
+OAuth 会话在兑换前一次性认领，公开回调、手动兑换和账号更新共享此状态。并发或重复兑换被拒绝；失败后需要重新发起授权，不重用可能已被上游消费的 code。回调处理期间轮询返回 `processing`，完成后返回 `completed` 并清理会话；回调页面与轮询结果只提供通用错误，脱敏诊断保留在服务端日志。
+
+自助提交账号的凭据、禁用状态、联系人备注、`self-service` 标签及凭据族在同一数据库事务中保存。保存失败不留下半成品账号，也不占用该账号身份；重新发起授权后可以再次提交。待审核账号在管理员批准前不进入调度池。
+
+Responses、Chat、compact、Images、原生 Gemini 及下游 Responses WS 的上游 HTTP 错误处理最多读取 1 MiB 前缀；Responses/compact 直接聚合的成功 JSON 与 Grok namespace 非流式改写最多读取 64 MiB，超限成功 JSON 明确报错，不会作为截断 JSON 返回。新增 SSE 读取路径的单行上限为 8 MiB，Grok SSE 聚合还限制完整事件为 8 MiB，超限错误会向调用方传播。这些是本地资源边界，不代表更大的 Base64 图片或工具输出在上游协议中一定非法，也不代表 OAuth 等其他 HTTP 客户端都复用此预算。
+
 ### API Key 模型周请求次数预算
 
 API Key 的 `limits.model_request_limits` 可按最终映射模型限制固定日历周的请求次数。支持精确模型名及 `*` 通配，一条规则的匹配模型共用预算，多条命中规则同时生效。配置字段、计数口径及更新规则详见 [配置说明](CONFIGURATION.md#api-key-模型周请求次数预算)。
@@ -2756,6 +2877,16 @@ X-Admin-Key: YOUR_ADMIN_SECRET
 ```
 
 公开自助接口 `GET /api/key-usage/summary` 与别名 `GET /api/key-usage/me` 在原有 `key`、`range`、`usage` 之外增加相同结构的顶层 `model_request_usage`。传入 `Authorization: Bearer YOUR_API_KEY`，只返回此 Key 的预算，不能通过查询参数读取其他 Key；公开用量页关闭时继续返回 `404`。没有配置时该字段为 `[]`。此字段始终反映当前固定周，与报表的 `range` 参数独立。
+
+该接口的请求日志（`usage.recent_logs`）支持以下可选筛选参数，只影响日志列表与 `recent_logs_total`，不影响 `summary`、`windows` 和模型/端点排行：
+
+- `model`：同时匹配请求模型与实际生效模型；
+- `endpoint`：匹配入站端点（与日志中的 `endpoint` 同口径）；
+- `status`：`success`（< 400）、`error`（≥ 400）、`4xx`、`5xx`、`429`；
+- `stream`：`stream` 或 `sync`；
+- `channel`：上游渠道，`codex`、`grok`、`antigravity` 或 `claude`。
+
+非法的 `status` / `stream` / `channel` 取值或超过 128 字符的 `model` / `endpoint` 返回 `400`。响应中的 `usage.log_models` 与 `usage.log_endpoints` 列出当前 `range` 内出现过的请求模型和入站端点（按请求量降序，各最多 50 个，不受筛选影响），可用于构造筛选下拉；每条日志额外带 `channel` 字段（`codex`、`claude`、`grok`、`antigravity` 或空字符串）。
 
 预算耗尽时 HTTP 返回 `429`，错误码为 `rate_limit_reached`，`Retry-After` 表示距离该规则重置的秒数。`error.details` 包含耗尽规则的用量快照：
 

@@ -8,7 +8,7 @@ import (
 )
 
 // IsSparkUsagePlan reports whether the account should show a spark usage bar.
-// prolite is folded into pro by NormalizePlanType.
+// prolite/promax are folded into pro by NormalizePlanType.
 func IsSparkUsagePlan(plan string) bool {
 	return NormalizePlanType(plan) == "pro"
 }
@@ -70,7 +70,7 @@ func (a *Account) SparkDispatchEligible() bool {
 	if a == nil {
 		return false
 	}
-	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) {
 		return false
 	}
 	a.mu.RLock()
@@ -110,7 +110,7 @@ func (a *Account) sparkUsageExhaustedLocked(now time.Time) bool {
 // SparkDispatchUsageLimited reports that the account is blocked only because
 // the independent spark window is full. Used to return 429 instead of 503.
 func (a *Account) SparkDispatchUsageLimited() bool {
-	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) {
 		return false
 	}
 	a.mu.RLock()
@@ -210,7 +210,7 @@ func (s *Store) ClearAbsentUsageSnapshotSparkAt(acc *Account, observedAt time.Ti
 	acc.ResetSparkAt = time.Time{}
 	acc.UsageUpdatedAtSpark = time.Time{}
 	if s != nil {
-		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+		acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	}
 	acc.mu.Unlock()
 

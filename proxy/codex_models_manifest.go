@@ -23,7 +23,8 @@ import (
 
 // CodexModelsManifestHandler 向 Codex 客户端提供模型清单。
 //
-// 有可调度的 ChatGPT OAuth 账号时，凭据实时转发官方清单（响应体与 ETag 原样透传）。
+// 有可调度的 ChatGPT OAuth 账号时，使用官方清单并按当前账号池的能力交集收窄。
+// 客户端缓存使用网关表示的 ETag，避免上游 304 绕过账号范围/凭据变化。
 // Antigravity / 仅中转号池没有 ChatGPT 账号：把与 Cockpit 相同的 /v1/models
 // 目录改写成 Codex 期望的 {"models":[{"slug":...}]}，避免客户端 503 后静默
 // 冻结在本地缓存（选单不全、模型信息联不通）。
@@ -44,20 +45,17 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	}
 	restrictManifest := codexManifestNeedsFiltering(row, account)
 	extraModels := h.extraRelayManifestModels(c.Request.Context(), row)
-	ifNoneMatch := c.GetHeader("If-None-Match")
-	if restrictManifest || len(extraModels) > 0 {
-		// Restricted responses use a gateway ETag derived from the filtered
-		// or locally merged representation. It is not an upstream validator, and
-		// forwarding it can produce a body-less 304 that cannot be rebuilt safely.
-		ifNoneMatch = ""
-	}
+	// Capability intersections can change when account scope or credentials
+	// change, even if the source descriptor is unchanged. Always fetch a body
+	// and compare the client's validator against the final gateway descriptor.
 
 	manifest, err := FetchCodexModelsManifest(
 		c.Request.Context(),
 		account,
 		h.store.ResolveProxyForAccount(account),
 		c.Query("client_version"),
-		ifNoneMatch,
+		"",
+		c.Request.Header,
 	)
 	if err != nil {
 		if h.serveScopedCodexManifest(c, row) {
@@ -91,10 +89,9 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	}
 
 	if manifest.NotModified {
-		if manifest.ETag != "" {
-			c.Header("ETag", manifest.ETag)
-		}
-		c.Status(http.StatusNotModified)
+		api.SendErrorWithStatus(c,
+			api.NewAPIError(api.ErrCodeUpstreamError, "codex models manifest returned an unusable 304", api.ErrorTypeUpstream),
+			http.StatusBadGateway)
 		return
 	}
 	// 顺手把清单里注册表不认识的新模型学习进注册表（只增不改不删），
@@ -135,6 +132,7 @@ func (h *Handler) writeMergedCodexManifest(c *gin.Context, body []byte, upstream
 			merged = next
 		}
 	}
+	merged = h.applyUpstreamModelCapabilities(c.Request.Context(), apiKeyRowFromContext(c), merged)
 	etag := upstreamETag
 	if etag == "" || string(merged) != string(body) {
 		etag = ""
@@ -152,7 +150,8 @@ func (h *Handler) extraRelayManifestModels(ctx context.Context, row *database.AP
 		if record == nil {
 			continue
 		}
-		if record.backing&(modelBackingRelay|modelBackingGrok|modelBackingAntigravity) == 0 {
+		_, daybreak := auth.ParseDaybreakAlias(record.id)
+		if record.backing&(modelBackingRelay|modelBackingGrok|modelBackingAntigravity) == 0 && daybreak == "" {
 			continue
 		}
 		extras = append(extras, api.Model{ID: record.id, Object: "model", OwnedBy: scopedModelOwner(record)})
@@ -245,10 +244,10 @@ func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
 			for _, level := range available {
 				item.SupportedReasoningLevels = append(item.SupportedReasoningLevels, codexReasoningLevel{Effort: level, Description: "Antigravity " + level + " reasoning"})
 			}
-			item.DefaultReasoningLevel = available[0]
+			item.DefaultReasoningLevel = antigravityModelChoiceDefaultLevel(slug, available)
 			item.SupportsReasoningSummaries = true
 		}
-		if slug == "gemini-3.8-flash" {
+		if slug == "gemini-3.8-flash" || (slug == "gemini-4-argon" && len(levels[slug]) > 0) {
 			item.ContextWindow = 1048576
 			// The current OAuth adapter accepts text parts only, even though the
 			// upstream model itself has vision. Advertise the gateway contract.
@@ -452,15 +451,18 @@ type CodexModelsManifest struct {
 // 响应体原样透传，不在本地解析或维护清单：manifest schema 随 Codex 客户端版本
 // 演进，透传使网关无需跟进 schema 变化，且返回的始终是账号真实的模型权限
 // （区别于内置模型注册表的"理论列表"）。
-func FetchCodexModelsManifest(ctx context.Context, account *auth.Account, proxyURL, clientVersion, ifNoneMatch string) (*CodexModelsManifest, error) {
+//
+// downstream 是下游透传请求的原始头（后台拉取传 nil），只在统一身份开关开启时参与
+// 出站身份解析，规则与对话请求一致。
+func FetchCodexModelsManifest(ctx context.Context, account *auth.Account, proxyURL, clientVersion, ifNoneMatch string, downstream http.Header) (*CodexModelsManifest, error) {
 	endpoint := CodexModelsManifestURL
 	if codexModelsManifestURLForTest != "" {
 		endpoint = codexModelsManifestURLForTest
 	}
-	return fetchCodexModelsManifestWithURL(ctx, account, proxyURL, endpoint, clientVersion, ifNoneMatch)
+	return fetchCodexModelsManifestWithURL(ctx, account, proxyURL, endpoint, clientVersion, ifNoneMatch, downstream)
 }
 
-func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account, proxyURL, endpoint, clientVersion, ifNoneMatch string) (*CodexModelsManifest, error) {
+func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account, proxyURL, endpoint, clientVersion, ifNoneMatch string, downstream http.Header) (*CodexModelsManifest, error) {
 	if account == nil {
 		return nil, fmt.Errorf("account is nil")
 	}
@@ -469,9 +471,21 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 		return nil, fmt.Errorf("account has no access token")
 	}
 
+	// UA 版本段、Version 头与 client_version query 三者保持同一版本，避免出站身份
+	// 自相矛盾。统一身份开启时三者都取解析出的身份版本：清单按 client_version 过滤
+	// 模型，对话请求以该版本出站，清单也必须按同一版本拿。
+	identity := ResolveCodexMaintenanceIdentity(account, downstream)
+	userAgent := ""
+	if identity.Unified {
+		clientVersion = firstNonEmptyString(identity.Version, clientVersion)
+		userAgent = identity.UserAgent
+	}
 	clientVersion = strings.TrimSpace(clientVersion)
 	if clientVersion == "" {
 		clientVersion = effectiveLatestCodexCLIVersion()
+	}
+	if userAgent == "" {
+		userAgent = replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, clientVersion)
 	}
 	requestURL := endpoint + "?client_version=" + url.QueryEscape(clientVersion)
 
@@ -483,10 +497,8 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	// UA 版本段与 Version 头、client_version query 三者保持同一版本，
-	// 避免出站身份自相矛盾（UA 钉内置常量、Version 跟随同步值）。
-	req.Header.Set("User-Agent", replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, clientVersion))
-	req.Header.Set("Originator", Originator)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Originator", identity.Originator)
 	req.Header.Set("Version", clientVersion)
 	if ifNoneMatch = strings.TrimSpace(ifNoneMatch); ifNoneMatch != "" {
 		req.Header.Set("If-None-Match", ifNoneMatch)

@@ -30,6 +30,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Validate build version
+        env:
+          BUILD_VERSION: ${{ inputs.build_version || github.ref_name }}
+        run: |
+          if [[ "$BUILD_VERSION" == *$'\n'* || "$BUILD_VERSION" == *$'\r'* ]]; then
+            echo "Invalid BUILD_VERSION: newlines are not allowed" >&2
+            exit 1
+          fi
+          if ! [[ "$BUILD_VERSION" =~ ^[0-9A-Za-z._-]{1,64}$ ]]; then
+            echo "Invalid BUILD_VERSION: must match ^[0-9A-Za-z._-]{1,64}$" >&2
+            exit 1
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

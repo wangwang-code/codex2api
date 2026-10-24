@@ -1,3 +1,6 @@
+import { useIntelligenceBars } from "../hooks/useIntelligenceBars";
+import AccountIntelligenceBar, { AccountIntelligenceActions } from "../components/AccountIntelligenceBar";
+import type { IntelligenceBar } from "../lib/intelligenceCheck";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -59,6 +62,7 @@ import RequestCountPills from "../components/RequestCountPills";
 import ColumnSettingsMenu from "../components/ColumnSettingsMenu";
 import { CompactStat } from "../components/CompactStat";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import BatchAccountGroupModal from "../components/BatchAccountGroupModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import StateShell from "../components/StateShell";
@@ -155,17 +159,15 @@ function formatCompactNum(v: unknown): string {
   return String(Math.round(n));
 }
 
-// pad2 两位补零。
-const pad2 = (n: number) => String(n).padStart(2, "0");
-
 // formatShortDateTime "MM-DD HH:mm" 短格式(与 Codex 卡片的 ⏱ 重置时间一致口径)。
 function formatShortDateTime(iso?: string): { label: string; title: string } | null {
   if (!iso) return null;
   const d = new Date(iso);
   if (!Number.isFinite(d.getTime())) return null;
+  const full = formatBeijingTime(iso);
   return {
-    label: `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`,
-    title: d.toLocaleString(),
+    label: full.slice(5, 16),
+    title: full,
   };
 }
 
@@ -574,7 +576,7 @@ function ClaudeConcurrencyBadge({ acc }: { acc: AccountRow }) {
   const showOccupied = acc.session_slot_buffer_enabled === true;
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-blue-700 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-300"
+      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-blue-700 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-300"
       title={showOccupied
         ? t("accounts.occupiedRequestsTooltip", { active, occupied, buffered })
         : t("accounts.activeRequestsTooltip", { count: active })}
@@ -690,6 +692,7 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
   }, [visibleCols]);
   const [knownPlans, setKnownPlans] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [batchGroupOpen, setBatchGroupOpen] = useState(false);
   const reloadAbortRef = useRef<AbortController | null>(null);
   const reloadGenerationRef = useRef(0);
   const legacyUsageRefreshRef = useRef<Set<number>>(new Set());
@@ -1075,6 +1078,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
     },
     [reload, showToast],
   );
+
+  const { bars: intelligenceBars, error: intelligenceBarsError } = useIntelligenceBars(accountIDsKey, pageStatsToken);
 
   // 健康状态条数据。
   useEffect(() => {
@@ -1881,6 +1886,10 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
               <PowerOff className="size-3.5" />
               <span className="hidden sm:inline">{t("accounts.disable")}</span>
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setBatchGroupOpen(true)}>
+              <FolderOpen className="size-3.5" />
+              <span className="hidden sm:inline">{t("accounts.batchGroupEdit")}</span>
+            </Button>
             <HeaderActionMenu
               label={t("accounts.batchMore")}
               icon={<MoreHorizontal className="size-3.5" />}
@@ -1977,6 +1986,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                       onToggleSelect={() => toggleSelect(acc.id)}
                       groupMap={groupMap}
                       healthBuckets={healthBars[String(acc.id)]}
+                      intelligenceBar={intelligenceBars[String(acc.id)]}
+                      intelligenceError={intelligenceBarsError}
                       showDomainTags={!hideDomainTags}
                       columns={visibleCols}
                       proxyCtx={proxyBindingCtx}
@@ -2043,6 +2054,21 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
         />
       ) : null}
 
+      <BatchAccountGroupModal
+        show={batchGroupOpen}
+        ids={selectedIds}
+        channel="claude"
+        groups={claudeGroups}
+        onClose={() => setBatchGroupOpen(false)}
+        onSaved={() => {
+          setBatchGroupOpen(false);
+          setSelected(new Set());
+          void reloadGroups();
+          void reload();
+        }}
+        onGroupsChanged={reloadGroups}
+      />
+
       {assignTarget ? (
         <AssignGroupsModal
           account={assignTarget}
@@ -2097,6 +2123,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
           account={detailTarget}
           groups={(detailTarget.group_ids ?? []).map((id) => groupMap.get(id)).filter(Boolean) as AccountGroup[]}
           healthBuckets={healthBars[String(detailTarget.id)]}
+          intelligenceBar={intelligenceBars[String(detailTarget.id)]}
+          intelligenceError={intelligenceBarsError}
           usageSlot={detailTarget.claude_auth_kind === "api_key" ? <p className="text-xs text-muted-foreground">{t("claude.apiKeyUsageNA")}</p> :
             <div className="space-y-1.5 rounded-xl border border-border bg-card p-3">
               <UsageWindow label={t("claude.usage5h")} pct={claudeUsagePct(detailTarget.usage_percent_5h)} reset={detailTarget.reset_5h_at} detail={detailTarget.usage_5h_detail} />
@@ -2204,6 +2232,8 @@ function ClaudeAccountRow({
   onToggleSelect,
   groupMap,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   showDomainTags,
   columns,
   proxyCtx,
@@ -2231,6 +2261,8 @@ function ClaudeAccountRow({
   onToggleSelect: () => void;
   groupMap: Map<number, AccountGroup>;
   healthBuckets?: AccountHealthBucket[];
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   showDomainTags: boolean;
   columns: ClaudeColVisibility;
   proxyCtx: ProxyBindingContext;
@@ -2482,14 +2514,18 @@ function ClaudeAccountRow({
         <TableCell data-account-state-cell="status">
           {tableOverlay ?? (
             <div className="min-w-[168px] max-w-[240px] space-y-1.5">
-              <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                <StatusBadge status={getAccountStatusBadgeStatus(acc)} errorMessage={acc.error_message} detail={cooldownReason} />
+              <div className="flex min-h-6 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                <div className="inline-flex shrink-0 items-center gap-1.5">
+                  <StatusBadge status={getAccountStatusBadgeStatus(acc)} errorMessage={acc.error_message} detail={cooldownReason} />
+                  <AccountIntelligenceActions bar={intelligenceBar} accountID={acc.id} accountName={acc.email || acc.name} />
+                </div>
                 <LiveCountdown until={acc.cooldown_until} label={t("claude.resetIn")} />
                 <ClaudeConcurrencyBadge acc={acc} />
               </div>
               {/* 采样状态与最后采样时间合成一行:状态点 + 文案 + 相对时间,错误信息放 title */}
               {acc.claude_api && !isAPIKey ? <ClaudeSampleStateLine acc={acc} /> : null}
               <AccountHealthBar buckets={healthBuckets} />
+              <AccountIntelligenceBar bar={intelligenceBar} accountID={acc.id} accountName={acc.email || acc.name} error={intelligenceError} />
             </div>
           )}
         </TableCell>

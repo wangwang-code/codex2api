@@ -18,6 +18,11 @@ const (
 	AntigravityAuthKindOAuth  = "oauth"
 	AntigravityAuthKindAPIKey = "api_key"
 
+	// AntigravityUserProjectIDCredentialKey stores the operator-supplied Google
+	// Cloud project. It is kept apart from project_id, which is always rebuilt
+	// from loadCodeAssist/onboardUser on every identity sync.
+	AntigravityUserProjectIDCredentialKey = "antigravity_user_project_id"
+
 	// AntigravityExperimentalInteractionsEnv gates the API-key Interactions
 	// executor. Its request/response wire adapter is still incomplete, so live
 	// inference is fail-closed unless an operator explicitly opts in.
@@ -91,11 +96,12 @@ func (a *Account) AntigravityAPIKey() string {
 // Public model discovery expands these backing IDs through the proxy's native
 // model projection; keeping wire IDs here preserves request admission and
 // capability checks when an account has not completed its first sync yet.
+// Claude is deliberately absent: Cloud Code migrates accounts between Claude
+// generations one by one (a retired ID returns "no longer available"), and the
+// Gemini API used by API-key accounts has no Claude at all, so only a
+// synchronized catalog can say which Claude IDs an account may call.
 func AntigravityDefaultModelIDs() []string {
 	return []string{
-		"gemini-3.5-flash-extra-low",
-		"gemini-3.5-flash-low",
-		"gemini-3-flash-agent",
 		"gemini-3.6-flash-low",
 		"gemini-3.6-flash-medium",
 		"gemini-3.6-flash-high",
@@ -103,8 +109,6 @@ func AntigravityDefaultModelIDs() []string {
 		"gemini-3.8-flash-tiered",
 		"gemini-3.1-pro-low",
 		"gemini-pro-agent",
-		"claude-opus-4-6-thinking",
-		"claude-sonnet-4-6",
 		"gpt-oss-120b-medium",
 	}
 }
@@ -123,6 +127,18 @@ func (a *Account) AntigravityModels() []string {
 		return cloneStringSlice(a.Models)
 	}
 	return AntigravityDefaultModelIDs()
+}
+
+// AntigravityModelMaxOutputTokens returns the provider-reported output limit
+// for a wire model from the last synchronized quota snapshot.
+func (a *Account) AntigravityModelMaxOutputTokens(model string) (int, bool) {
+	if a == nil {
+		return 0, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	limit, ok := a.antigravityModelMaxOutput[strings.ToLower(strings.TrimSpace(model))]
+	return limit, ok
 }
 
 // AntigravitySupportsModel keeps admission aligned with the exposed catalog.
@@ -148,7 +164,7 @@ func (a *Account) applyAntigravitySchedulerOverrideLocked(baseLimit int64, tier 
 		return tier, limit, available
 	}
 	// Administrative fences are never bypassed by the OAuth refresh escape hatch.
-	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 || a.Status == StatusError {
+	if atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) || a.Status == StatusError {
 		return tier, limit, false
 	}
 	recoverUnauthorized := a.antigravityUnauthorizedRecoveryLocked(time.Now())
@@ -217,11 +233,15 @@ type AntigravityCredential struct {
 	Name                 string
 	AvatarURL            string
 	ProjectID            string
-	OAuthClientKey       string
-	ClientID             string
-	ClientSecret         string
-	Scope                string
-	ExpiresAt            time.Time
+	// UserProjectID is an operator-supplied Google Cloud project. Workspace /
+	// enterprise tiers (Gemini Code Assist Standard/Enterprise) are never given
+	// a managed project by onboardUser and must run against a caller-owned one.
+	UserProjectID  string
+	OAuthClientKey string
+	ClientID       string
+	ClientSecret   string
+	Scope          string
+	ExpiresAt      time.Time
 }
 
 type AntigravityProfile struct {
@@ -240,6 +260,9 @@ type AntigravityTier struct {
 	QuotaTier string `json:"quota_tier,omitempty"`
 	Slug      string `json:"slug,omitempty"`
 	IsDefault bool   `json:"is_default,omitempty"`
+	// UserDefinedProject mirrors userDefinedCloudaicompanionProject: the tier
+	// runs against a Google Cloud project the account owner must supply.
+	UserDefinedProject bool `json:"user_defined_project,omitempty"`
 }
 
 type AntigravityIneligibleTier struct {

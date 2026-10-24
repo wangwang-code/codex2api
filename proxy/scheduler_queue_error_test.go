@@ -50,7 +50,7 @@ func TestDispatchWaitTimeoutZeroFailsImmediately(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	started := time.Now()
-	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.DispatchPolicyStandard)
+	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	elapsed := time.Since(started)
 
 	if account != nil || err != nil {
@@ -107,6 +107,9 @@ func saturatedSchedulerQueue(t *testing.T) *auth.Store {
 	return store
 }
 
+// TestSchedulerQueueOverloadStopsContinuousRetry 断言调度队列准入被拒时选号立即带着
+// ErrSchedulerQueueFull 返回，不再进入持续重试循环，且既有上游重试排除项保持不变、
+// 拒绝计数各记一次。
 func TestSchedulerQueueOverloadStopsContinuousRetry(t *testing.T) {
 	s := saturatedSchedulerQueue(t)
 	h := &Handler{store: s}
@@ -114,7 +117,7 @@ func TestSchedulerQueueOverloadStopsContinuousRetry(t *testing.T) {
 	exclusions.MarkTransient(99)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	_, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if !errors.Is(err, auth.ErrSchedulerQueueFull) || ctx.Err() != nil {
 		t.Fatalf("overload was retried: %v (context %v)", err, ctx.Err())
 	}
@@ -164,20 +167,54 @@ func TestSchedulerQueueOverloadCommittedSSE(t *testing.T) {
 		{continuousRetryProtocolResponses, `"type":"response.failed"`},
 		{continuousRetryProtocolChat, `"error"`},
 		{continuousRetryProtocolAnthropic, "event: error"},
+		{continuousRetryProtocolGemini, `"status":"UNAVAILABLE"`},
 	} {
 		r := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(r)
 		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 		c.Header("Content-Type", "text/event-stream")
-		_, _ = c.Writer.WriteString(": keepalive\n\n")
+		keepalive := ": keepalive\n\n"
+		if tc.protocol == continuousRetryProtocolGemini {
+			keepalive = "data: {}\n\n"
+		}
+		_, _ = c.Writer.WriteString(keepalive)
 		c.Writer.Flush()
 		if !writeSchedulerQueueError(c, auth.ErrSchedulerQueueFull, tc.protocol) {
 			t.Fatal("overload not handled")
 		}
 		body := r.Body.String()
-		if r.Code != http.StatusOK || !strings.HasPrefix(body, ": keepalive\n\n") || !strings.Contains(body, tc.marker) || !strings.Contains(body, schedulerQueueFullMessage) {
+		if r.Code != http.StatusOK || !strings.HasPrefix(body, keepalive) || !strings.Contains(body, tc.marker) || !strings.Contains(body, schedulerQueueFullMessage) {
 			t.Fatalf("committed overload response = %d %s", r.Code, body)
 		}
+		if tc.protocol == continuousRetryProtocolGemini && (strings.Contains(body, "response.failed") || !strings.Contains(body, `"code":503`)) {
+			t.Fatalf("overload response must use the Gemini error envelope: %s", body)
+		}
+		if tc.protocol == continuousRetryProtocolGemini && (!json.Valid([]byte(strings.TrimPrefix(body, keepalive))) || strings.HasSuffix(body, "\n")) {
+			t.Fatalf("Gemini SDK expects a terminal bare JSON error without an SSE delimiter: %q", body)
+		}
+	}
+}
+
+func TestSchedulerQueueOverloadGeminiJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(r)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini:generateContent", nil)
+	if !writeSchedulerQueueError(c, auth.ErrSchedulerQueueFull, continuousRetryProtocolGemini) {
+		t.Fatal("overload not handled")
+	}
+	var payload struct {
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Status  string `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid Gemini JSON response: %s", r.Body.String())
+	}
+	if r.Code != http.StatusServiceUnavailable || r.Header().Get("Retry-After") != "1" || payload.Error.Code != http.StatusServiceUnavailable || payload.Error.Status != "UNAVAILABLE" || payload.Error.Message != schedulerQueueFullMessage {
+		t.Fatalf("Gemini overload response = %d, retry-after=%q, %s", r.Code, r.Header().Get("Retry-After"), r.Body.String())
 	}
 }
 
@@ -190,14 +227,19 @@ func TestSelectionTimeoutHTTPProtocols(t *testing.T) {
 		{continuousRetryProtocolResponses, `"type":"response.failed"`},
 		{continuousRetryProtocolChat, `"error"`},
 		{continuousRetryProtocolAnthropic, "event: error"},
+		{continuousRetryProtocolGemini, `"status":"UNAVAILABLE"`},
 	} {
 		for _, committed := range []bool{false, true} {
 			r := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(r)
 			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			keepalive := ": keepalive\n\n"
+			if tc.protocol == continuousRetryProtocolGemini {
+				keepalive = "data: {}\n\n"
+			}
 			if committed {
 				c.Header("Content-Type", "text/event-stream")
-				_, _ = c.Writer.WriteString(": keepalive\n\n")
+				_, _ = c.Writer.WriteString(keepalive)
 				c.Writer.Flush()
 			}
 			if !writeSchedulerQueueError(c, context.DeadlineExceeded, tc.protocol) {
@@ -207,8 +249,14 @@ func TestSelectionTimeoutHTTPProtocols(t *testing.T) {
 			if !strings.Contains(body, schedulerSelectionTimeoutMessage) {
 				t.Fatalf("missing selection timeout: %s", body)
 			}
+			if tc.protocol == continuousRetryProtocolGemini && (strings.Contains(body, "response.failed") || !strings.Contains(body, `"code":503`) || !strings.Contains(body, tc.marker)) {
+				t.Fatalf("selection timeout must use the Gemini error envelope: %s", body)
+			}
+			if tc.protocol == continuousRetryProtocolGemini && committed && (!json.Valid([]byte(strings.TrimPrefix(body, keepalive))) || strings.HasSuffix(body, "\n")) {
+				t.Fatalf("Gemini SDK expects a terminal bare JSON error without an SSE delimiter: %q", body)
+			}
 			if committed {
-				if r.Code != http.StatusOK || !strings.HasPrefix(body, ": keepalive\n\n") || !strings.Contains(body, tc.marker) {
+				if r.Code != http.StatusOK || !strings.HasPrefix(body, keepalive) || !strings.Contains(body, tc.marker) {
 					t.Fatalf("committed timeout response = %d %s", r.Code, body)
 				}
 			} else if r.Code != http.StatusServiceUnavailable || r.Header().Get("Retry-After") != "1" {
@@ -243,12 +291,20 @@ func TestSchedulerQueueOverloadResponsesWebSocket(t *testing.T) {
 	if json.Unmarshal(payload, &event) != nil || event["type"] != "error" || !strings.Contains(string(payload), schedulerQueueFullMessage) {
 		t.Fatalf("WS overload frame = %s", payload)
 	}
-	_, _, err = conn.ReadMessage()
-	if !websocket.IsCloseError(err, websocket.CloseTryAgainLater) {
-		t.Fatalf("WS overload close = %v", err)
+	if float64(http.StatusServiceUnavailable) != event["status"] {
+		t.Fatalf("WS overload status = %v", event["status"])
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "gpt-5.5", "input": "retry"}); err != nil {
+		t.Fatal(err)
+	}
+	_, payload, err = conn.ReadMessage()
+	if err != nil || !strings.Contains(string(payload), schedulerQueueFullMessage) {
+		t.Fatalf("WS overload prevented another turn: %s %v", payload, err)
 	}
 }
 
+// TestSchedulerWaitHeartbeatPreservesOneAdmission 断言等待期间心跳按间隔持续写出保活帧，
+// 既保持连接活跃，也不会重复占用队列准入名额或遗留等待者。
 func TestSchedulerWaitHeartbeatPreservesOneAdmission(t *testing.T) {
 	previous := continuousRetryKeepaliveInterval
 	continuousRetryKeepaliveInterval = 5 * time.Millisecond
@@ -260,7 +316,7 @@ func TestSchedulerWaitHeartbeatPreservesOneAdmission(t *testing.T) {
 	keepalive := &recordingContinuousRetryKeepalive{active: true}
 	ctx, cancel := context.WithTimeout(contextWithContinuousRetryKeepalive(keepalive), 35*time.Millisecond)
 	defer cancel()
-	_, _, _, _ = h.waitForRetryAccountAvailableWithGuard(ctx, "", 0, nil, nil, false, auth.DispatchPolicyStandard)
+	_, _, _, _ = h.waitForRetryAccountAvailableWithGuard(ctx, "", 0, nil, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	m := store.GetSchedulerMetrics()
 	if keepalive.writes < 2 || m.WaitStarted != 1 || m.Waiters != 0 || m.SelectionTotal != 1 {
 		t.Fatalf("heartbeats disturbed queue: writes=%d metrics=%+v", keepalive.writes, m)
