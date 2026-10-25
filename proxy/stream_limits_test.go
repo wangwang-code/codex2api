@@ -68,12 +68,12 @@ func TestResolveStreamLimitBudgetEmptyMatchersMatchAnything(t *testing.T) {
 	streamLimitsEnabled = true
 	streamLimitRules = []streamLimitRule{{Name: "all", BaseChars: 100, MinChars: 100}}
 
-	for _, tc := range []struct{ apiKey, model string }{
-		{"sk-anything", "gpt-5.6-codex"},
-		{"", ""},
-		{"sk-other", "claude-sonnet-4-5"},
+	for _, tc := range []struct{ apiKey, name, model string }{
+		{"sk-anything", "", "gpt-5.6-codex"},
+		{"", "", ""},
+		{"sk-other", "shaft-42", "claude-sonnet-4-5"},
 	} {
-		if _, ok := resolveStreamLimitBudget(tc.apiKey, tc.model, 10); !ok {
+		if _, ok := resolveStreamLimitBudget(tc.apiKey, tc.name, tc.model, 10); !ok {
 			t.Fatalf("api-keys/models 留空时应匹配任意请求，未命中 %+v", tc)
 		}
 	}
@@ -85,7 +85,7 @@ func TestResolveStreamLimitBudget(t *testing.T) {
 	t.Cleanup(func() { streamLimitsEnabled, streamLimitRules = restoreEnabled, restoreRules })
 
 	streamLimitsEnabled = false
-	if _, ok := resolveStreamLimitBudget("sk-a", "gpt-5.6", 10); ok {
+	if _, ok := resolveStreamLimitBudget("sk-a", "", "gpt-5.6", 10); ok {
 		t.Fatal("关闭时不应命中")
 	}
 
@@ -96,7 +96,7 @@ func TestResolveStreamLimitBudget(t *testing.T) {
 			BaseChars: 100, CharsPerInputChar: 3, MinChars: 100, MaxChars: 5000, MaxUpstreamBytes: 1 << 20},
 	}
 
-	budget, ok := resolveStreamLimitBudget("sk-a", "gpt-5.6-codex", 100)
+	budget, ok := resolveStreamLimitBudget("sk-a", "", "gpt-5.6-codex", 100)
 	if !ok {
 		t.Fatal("应当命中 translation 规则")
 	}
@@ -107,11 +107,11 @@ func TestResolveStreamLimitBudget(t *testing.T) {
 		t.Fatalf("上游字节上限 = %d", budget.maxUpstreamBytes)
 	}
 	// API Key 不匹配 → 不命中。
-	if _, ok := resolveStreamLimitBudget("sk-c", "gpt-5.6-codex", 100); ok {
+	if _, ok := resolveStreamLimitBudget("sk-c", "", "gpt-5.6-codex", 100); ok {
 		t.Fatal("API Key 不匹配不应命中")
 	}
 	// 模型通配不匹配 → 不命中。
-	if _, ok := resolveStreamLimitBudget("sk-a", "claude-sonnet", 100); ok {
+	if _, ok := resolveStreamLimitBudget("sk-a", "", "claude-sonnet", 100); ok {
 		t.Fatal("模型不匹配不应命中")
 	}
 }

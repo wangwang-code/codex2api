@@ -46,7 +46,11 @@ const streamLimitAbortPayload = `{"error":{"message":"模型输出失控，已�
 // streamLimitRule 是一条流预算规则；API Keys 与 Models 都为空时匹配任意请求。
 type streamLimitRule struct {
 	Name string `json:"name"`
-	// APIKeys 精确匹配下游 API Key；空=任意。
+	// APIKeys 匹配下游 API Key **或** 密钥名称，支持 * 通配（如 shaft-*）；空=任意。
+	//
+	// 名称匹配是为了让按用户发密钥的部署不必把密钥明文写进配置：一个 uid 一把
+	// shaft-{uid}，规则里写 shaft-* 就能覆盖全部用户，而明文密钥一旦轮换就得改配置。
+	// 同一个模式对「密钥串」和「密钥名」都试一次，历史配置（写死 sk-...）照旧生效。
 	APIKeys []string `json:"api-keys"`
 	// Models 匹配请求模型，支持 shell 通配（如 gpt-5.6-*）；空=任意。
 	Models []string `json:"models"`
@@ -108,8 +112,45 @@ func streamLimitRulesFromEnv() []streamLimitRule {
 	}
 	for _, rule := range rules {
 		logStreamLimitRuleCurve(rule)
+		logStreamLimitRuleMatchers(rule)
 	}
 	return rules
+}
+
+// logStreamLimitRuleMatchers 打印 api-keys 的匹配方式，并对「写死明文密钥」发出告警。
+//
+// 按用户发密钥之后，写死 sk-... 的规则只对那一把密钥生效，其余用户静默不受预算
+// 约束——这种失效没有任何运行时信号，只能靠启动日志暴露。
+func logStreamLimitRuleMatchers(rule streamLimitRule) {
+	if len(rule.APIKeys) == 0 {
+		return
+	}
+	var byName, byKey, pinned []string
+	for _, pattern := range rule.APIKeys {
+		pattern = strings.TrimSpace(pattern)
+		switch {
+		case pattern == "":
+			continue
+		case strings.HasPrefix(pattern, "sk-"):
+			byKey = append(byKey, pattern)
+			if !strings.Contains(pattern, "*") {
+				pinned = append(pinned, pattern)
+			}
+		case strings.Contains(pattern, "*"):
+			byName = append(byName, pattern)
+		default:
+			byName = append(byName, pattern)
+		}
+	}
+	if len(byName) > 0 {
+		log.Printf("[Config] 流预算规则 %q：按密钥名/通配匹配 %v（同时比对密钥串，两者命中其一即可）", rule.Name, byName)
+	}
+	if len(byKey) > 0 {
+		log.Printf("[Config] 流预算规则 %q：按密钥串匹配 %d 条", rule.Name, len(byKey))
+	}
+	if len(pinned) > 0 {
+		log.Printf("[Config] 流预算规则 %q：警告——写死了 %d 条明文密钥，密钥轮换或按用户发密钥后这些规则会静默失效，建议改成名称通配（如 shaft-*）", rule.Name, len(pinned))
+	}
 }
 
 // logStreamLimitRuleCurve 在配置加载时打印规则的预算曲线，便于一眼看出标定是否合理。
@@ -155,13 +196,13 @@ func ConfigureStreamLimitsFromEnv() {
 	streamLimitRules = streamLimitRulesFromEnv()
 }
 
-// resolveStreamLimitBudget 按 API Key 与模型匹配第一条规则并算出预算。
-func resolveStreamLimitBudget(apiKey, model string, inputChars int) (streamLimitBudget, bool) {
+// resolveStreamLimitBudget 按 API Key（或密钥名）与模型匹配第一条规则并算出预算。
+func resolveStreamLimitBudget(apiKey, apiKeyName, model string, inputChars int) (streamLimitBudget, bool) {
 	if !streamLimitsEnabled {
 		return streamLimitBudget{}, false
 	}
 	for _, rule := range streamLimitRules {
-		if !streamLimitMatchAny(rule.APIKeys, strings.TrimSpace(apiKey)) {
+		if !streamLimitMatchAny(rule.APIKeys, strings.TrimSpace(apiKey), strings.TrimSpace(apiKeyName)) {
 			continue
 		}
 		if !streamLimitMatchModels(rule.Models, strings.TrimSpace(model)) {
@@ -183,16 +224,59 @@ func resolveStreamLimitBudget(apiKey, model string, inputChars int) (streamLimit
 	return streamLimitBudget{}, false
 }
 
-func streamLimitMatchAny(values []string, value string) bool {
-	if len(values) == 0 {
+// streamLimitMatchAny 判断任意模式是否命中任意候选值（密钥串或密钥名）。
+//
+// 空模式列表 = 匹配任意（沿用历史语义）；空候选值不参与匹配，否则 `*` 会把「没有
+// 密钥」的内部调用也算成命中。
+func streamLimitMatchAny(patterns []string, candidates ...string) bool {
+	if len(patterns) == 0 {
 		return true
 	}
-	for _, candidate := range values {
-		if strings.TrimSpace(candidate) == value {
-			return true
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		for _, candidate := range candidates {
+			if candidate == "" {
+				continue
+			}
+			if streamLimitGlobMatch(pattern, candidate) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// streamLimitGlobMatch 只把 `*` 当通配符，其余字符一律字面比较。
+//
+// 刻意不用 path.Match：它还把 `?` `[` `\` 当元字符，而密钥名和密钥串里这些字符
+// 完全可能出现，写规则的人却只会想到 `*`。少一种元字符就少一类误配。
+func streamLimitGlobMatch(pattern, value string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == value
+	}
+	parts := strings.Split(pattern, "*")
+	// 首段必须是最前缀。
+	if !strings.HasPrefix(value, parts[0]) {
+		return false
+	}
+	value = value[len(parts[0]):]
+	// 中间段按顺序各找一次，允许重叠之外的任意填充。
+	for _, part := range parts[1 : len(parts)-1] {
+		idx := strings.Index(value, part)
+		if idx < 0 {
+			return false
+		}
+		value = value[idx+len(part):]
+	}
+	// 末段必须是最后缀。
+	last := parts[len(parts)-1]
+	return strings.HasSuffix(value, last)
 }
 
 func streamLimitMatchModels(patterns []string, model string) bool {
@@ -307,7 +391,7 @@ func newStreamLimitStateForRequest(c *gin.Context, model string, rawBody []byte)
 	if !streamLimitsEnabled {
 		return nil
 	}
-	budget, ok := resolveStreamLimitBudget(apiKeyFromContext(c), model, countRequestTextChars(rawBody))
+	budget, ok := resolveStreamLimitBudget(apiKeyFromContext(c), apiKeyNameFromContext(c), model, countRequestTextChars(rawBody))
 	if !ok {
 		return nil
 	}
@@ -319,6 +403,15 @@ func apiKeyFromContext(c *gin.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(c.GetString("apiKey"))
+}
+
+// apiKeyNameFromContext 取鉴权中间件写入的密钥名称（如 shaft-12345）。
+// 规则按名称匹配时用它，密钥串本身不必出现在配置里。
+func apiKeyNameFromContext(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.GetString(contextAPIKeyName))
 }
 
 // observe 累计一次上游事件；返回 true 表示已超限，调用方应立即中止上游流。
