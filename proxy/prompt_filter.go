@@ -451,6 +451,9 @@ func (h *Handler) buildPromptFilterLogInput(auditContext promptFilterAuditContex
 		ReviewEndpoint:       verdict.ReviewEndpoint,
 		ReviewRequestMode:    verdict.ReviewRequestMode,
 		ReviewLatencyMS:      verdict.ReviewLatencyMS,
+		// 三态原样落库：审核没给这个字段时是 nil，不能折成 false——风险画像
+		// 靠它排除 R18 命中，「未知」被当成「明确不是 R18」会让排除失效。
+		IsR18: verdict.ReviewIsR18,
 		RequestCorrelationID: auditContext.RequestCorrelationID,
 		NewAPIPolicyStatus:   auditContext.NewAPIPolicyStatus,
 		NewAPIPlatform:       auditContext.NewAPIPlatform,

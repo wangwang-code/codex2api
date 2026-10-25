@@ -3128,6 +3128,7 @@
         "account_routing_review": "检查账号路由"
       },
       "events": {
+        "r18_excluded": "成人内容（不计入风险）",
         "review_cleared": "复核通过",
         "review_flagged_monitor": "模型命中（监控模式）",
         "local_block_strike": "本地终局拦截",
@@ -3902,6 +3903,8 @@
       "strike": "计入违规",
       "upstream": "上游",
       "reviewFlagged": "审查判定违规",
+      "r18Content": "成人内容",
+      "r18ExcludedHint": "审核模型判定为成人内容。这类记录仍会留档，但不计入请求与身份风险画像。",
       "reviewCleared": "审查判定通过"
     },
     "rulesCatalogTitle": "内置规则",

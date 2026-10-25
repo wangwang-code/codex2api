@@ -37,6 +37,10 @@ const (
 	promptRiskEventLocalBlock           = "local_block"
 	promptRiskEventLocalBlockUnverified = "local_block_unverified"
 	promptRiskEventLocalBlockCleared    = "local_block_cleared"
+	// promptRiskEventR18Excluded 标记「审核判定为成人内容」的记录。这类记录仍然
+	// 入库（能看出该主体有 R18 流量），但分数、置信度、指纹全部留空，聚合时
+	// 显式排除——否则重度 R18 用户会被自己的正常用量推成高风险。
+	promptRiskEventR18Excluded = "r18_excluded"
 )
 
 type PromptRiskProfile struct {
@@ -357,6 +361,26 @@ func promptRiskSignalForLog(log PromptFilterLog) (promptRiskSignal, bool) {
 	}
 	if reasonCode == "prompt_policy_shadow_async" || origin == "tool_output" || origin == "tool_arguments" || origin == "session_context" || origin == "history" || origin == "system" || origin == "developer" || origin == "instructions" || origin == "attachment_refs" || origin == "attachment_content" {
 		return promptRiskSignal{}, false
+	}
+	// R18 命中不计分。
+	//
+	// 这个网关的 R18 流量是正常业务（翻译成人向漫画），但审核模型会给它打
+	// flagged，于是一条正常请求就往画像里加 40 分。结果是重度用户被自己的正常
+	// 用量推高等级，画像失去区分度。整条记录标成 r18_excluded：留档、不计分。
+	//
+	// 只排除「本来会产生信号」的日志，所以放在上面两道门之后——被过滤掉的
+	// 日志本来就不计分，没必要为它们改变事件类型。
+	if log.IsR18 != nil && *log.IsR18 {
+		return promptRiskSignal{
+			SourceType: promptRiskSourceLog, SourceID: strconv.FormatInt(log.ID, 10), PromptFilterLogID: log.ID,
+			RequestCorrelationID: log.RequestCorrelationID, CreatedAt: log.CreatedAt,
+			EventKind: promptRiskEventR18Excluded, Action: log.Action, ReasonCode: log.ReasonCode,
+			Endpoint: log.Endpoint, Model: log.Model,
+			APIKeyID: log.APIKeyID, APIKeyName: log.APIKeyName, APIKeyMasked: log.APIKeyMasked,
+			NewAPIPolicyStatus: log.NewAPIPolicyStatus, NewAPIPlatform: log.NewAPIPlatform, NewAPIUserID: log.NewAPIUserID,
+			SessionHash: log.SessionHash, ClientIPHash: log.ClientIPHash,
+			// 刻意不设 PromptFingerprint：重复指纹会触发 recurrence 加分。
+		}, true
 	}
 	kind := ""
 	score := 0
@@ -726,7 +750,7 @@ func (db *DB) backfillPromptRiskLogs(ctx context.Context, cutoff time.Time) erro
 			COALESCE(l.api_key_masked,''), COALESCE(l.client_ip,''), COALESCE(l.review_model,''), COALESCE(l.review_flagged,false),
 			COALESCE(l.review_error,''), COALESCE(l.request_correlation_id,''), COALESCE(l.newapi_policy_status,''),
 			COALESCE(l.newapi_platform,''), COALESCE(l.newapi_user_id,''), COALESCE(l.newapi_request_id,''),
-			COALESCE(l.newapi_decision_id,''), COALESCE(l.session_hash,'')
+			COALESCE(l.newapi_decision_id,''), COALESCE(l.session_hash,''), l.is_r18
 		FROM prompt_filter_logs l
 		WHERE l.created_at >= $1 AND NOT EXISTS (
 			SELECT 1 FROM prompt_risk_event_sources s WHERE s.source_type=$2 AND s.source_id=CAST(l.id AS TEXT)
@@ -739,14 +763,16 @@ func (db *DB) backfillPromptRiskLogs(ctx context.Context, cutoff time.Time) erro
 			var item PromptFilterLog
 			var createdRaw any
 			var clientIP string
+			var isR18 sql.NullBool
 			if err := rows.Scan(&item.ID, &createdRaw, &item.Source, &item.Endpoint, &item.Model, &item.Action, &item.Score, &item.AuditScore,
 				&item.ReasonCode, &item.StrikeEligible, &item.MatchedPatterns, &item.TextPreview, &item.APIKeyID, &item.APIKeyName,
 				&item.APIKeyMasked, &clientIP, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.RequestCorrelationID,
 				&item.NewAPIPolicyStatus, &item.NewAPIPlatform, &item.NewAPIUserID, &item.NewAPIRequestID, &item.NewAPIDecisionID,
-				&item.SessionHash); err != nil {
+				&item.SessionHash, &isR18); err != nil {
 				rows.Close()
 				return err
 			}
+			item.IsR18 = promptFilterNullableBool(isR18)
 			item.ClientIPHash = promptRiskHash("client-ip", clientIP)
 			item.CreatedAt, err = parsePromptRiskTimeValue(createdRaw)
 			if err != nil {
@@ -1132,16 +1158,16 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 			COUNT(*) AS event_count, SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END) AS events_10m,
 			SUM(CASE WHEN created_at >= $3 THEN 1 ELSE 0 END) AS events_24h,
 			SUM(CASE WHEN created_at >= $4 THEN 1 ELSE 0 END) AS events_7d,
-			SUM(CASE WHEN request_risk_score>0 AND event_kind NOT IN ('local_audit_hit', 'review_cleared', 'local_security_context_observed', 'local_block', 'local_block_unverified', 'local_block_cleared') AND created_at >= $3 THEN 1 ELSE 0 END) AS positive_events_24h,
+			SUM(CASE WHEN request_risk_score>0 AND event_kind NOT IN ('local_audit_hit', 'review_cleared', 'local_security_context_observed', 'local_block', 'local_block_unverified', 'local_block_cleared', 'r18_excluded') AND created_at >= $3 THEN 1 ELSE 0 END) AS positive_events_24h,
 			SUM(CASE WHEN event_kind LIKE 'upstream_cy_%' THEN 1 ELSE 0 END) AS upstream_cy_count,
 			SUM(CASE WHEN event_kind='upstream_cy_confirmed_miss' THEN 1 ELSE 0 END) AS confirmed_miss_count,
 			SUM(CASE WHEN event_kind LIKE 'local_block%' THEN 1 ELSE 0 END) AS local_block_count,
 			SUM(CASE WHEN event_kind='local_warn' THEN 1 ELSE 0 END) AS local_warn_count,
-			SUM(CASE WHEN prompt_fingerprint<>'' AND event_kind NOT IN ('local_audit_hit', 'review_cleared', 'local_block', 'local_block_unverified', 'local_block_cleared') THEN 1 ELSE 0 END) AS fingerprint_events,
-			COUNT(DISTINCT CASE WHEN prompt_fingerprint<>'' AND event_kind NOT IN ('local_audit_hit', 'review_cleared', 'local_block', 'local_block_unverified', 'local_block_cleared') THEN prompt_fingerprint END) AS distinct_fingerprints,
+			SUM(CASE WHEN prompt_fingerprint<>'' AND event_kind NOT IN ('local_audit_hit', 'review_cleared', 'local_block', 'local_block_unverified', 'local_block_cleared', 'r18_excluded') THEN 1 ELSE 0 END) AS fingerprint_events,
+			COUNT(DISTINCT CASE WHEN prompt_fingerprint<>'' AND event_kind NOT IN ('local_audit_hit', 'review_cleared', 'local_block', 'local_block_unverified', 'local_block_cleared', 'r18_excluded') THEN prompt_fingerprint END) AS distinct_fingerprints,
 			MAX(api_key_id) AS api_key_id, MAX(api_key_name) AS api_key_name, MAX(api_key_masked) AS api_key_masked,
 			MAX(account_id) AS account_id, MAX(account_name) AS account_name,
-			SUM(CASE WHEN event_kind IN ('local_audit_hit', 'review_cleared', 'local_block', 'local_block_unverified', 'local_block_cleared') THEN 0 ELSE request_risk_score * evidence_confidence * identity_confidence * CASE WHEN created_at >= $2 THEN 100 WHEN created_at >= $3 THEN 75 WHEN created_at >= $4 THEN 40 ELSE 15 END END) AS weighted_total,
+			SUM(CASE WHEN event_kind IN ('local_audit_hit', 'review_cleared', 'local_block', 'local_block_unverified', 'local_block_cleared', 'r18_excluded') THEN 0 ELSE request_risk_score * evidence_confidence * identity_confidence * CASE WHEN created_at >= $2 THEN 100 WHEN created_at >= $3 THEN 75 WHEN created_at >= $4 THEN 40 ELSE 15 END END) AS weighted_total,
 			SUM(CASE WHEN event_kind LIKE 'local_%' AND event_kind NOT IN ('local_audit_hit', 'local_block', 'local_block_unverified', 'local_block_cleared') THEN request_risk_score * evidence_confidence * identity_confidence * CASE WHEN created_at >= $2 THEN 100 WHEN created_at >= $3 THEN 75 WHEN created_at >= $4 THEN 40 ELSE 15 END ELSE 0 END) AS weighted_local,
 			SUM(CASE WHEN event_kind LIKE 'upstream_cy_%' THEN request_risk_score * evidence_confidence * identity_confidence * CASE WHEN created_at >= $2 THEN 100 WHEN created_at >= $3 THEN 75 WHEN created_at >= $4 THEN 40 ELSE 15 END ELSE 0 END) AS weighted_upstream
 		FROM filtered_events

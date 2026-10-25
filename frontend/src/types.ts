@@ -2455,6 +2455,9 @@ export interface PromptFilterLog {
 	review_endpoint: string
 	review_request_mode: string
 	review_latency_ms: number | null
+	// 审核模型给出的成人内容判定；null/undefined = 未知（审核没跑或没给这个字段）。
+	// true 的记录不计入请求与身份风险画像。
+	is_r18?: boolean | null
 	request_correlation_id?: string
 	newapi_policy_status?: string
 	newapi_platform?: string

@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"strconv"
@@ -611,6 +612,9 @@ type PromptFilterLog struct {
 	ReviewEndpoint       string    `json:"review_endpoint"`
 	ReviewRequestMode    string    `json:"review_request_mode"`
 	ReviewLatencyMS      *int64    `json:"review_latency_ms"`
+	// IsR18 是审核模型给出的成人内容判定；nil=未知（审核没跑，或模型没给这个字段）。
+	// 风险画像据此排除 R18 命中，所以「未知」必须与「明确 false」分开存。
+	IsR18                *bool     `json:"is_r18,omitempty"`
 	RequestCorrelationID string    `json:"request_correlation_id,omitempty"`
 	NewAPIPolicyStatus   string    `json:"newapi_policy_status,omitempty"`
 	NewAPIPlatform       string    `json:"newapi_platform,omitempty"`
@@ -655,6 +659,7 @@ type PromptFilterLogInput struct {
 	ReviewEndpoint       string
 	ReviewRequestMode    string
 	ReviewLatencyMS      *int64
+	IsR18                *bool
 	RequestCorrelationID string
 	NewAPIPolicyStatus   string
 	NewAPIPlatform       string
@@ -683,6 +688,23 @@ type PromptFilterLogQuery struct {
 	ExcludeIntelligence bool
 }
 
+// isR18DBValue 把三态布尔转成驱动能写的值：nil 写 NULL（未知），否则写 true/false。
+func isR18DBValue(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+// promptFilterNullableBool 把读出来的可空布尔还原成三态指针。
+func promptFilterNullableBool(value sql.NullBool) *bool {
+	if !value.Valid {
+		return nil
+	}
+	out := value.Bool
+	return &out
+}
+
 func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogInput) error {
 	if db == nil || input == nil {
 		return nil
@@ -701,15 +723,16 @@ func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogI
 				match_context, api_key_id, api_key_name, api_key_masked, client_ip, error_code, review_model, review_flagged, review_error,
 				reviewed, review_confidence, review_threshold, review_reason, review_endpoint, review_request_mode, review_latency_ms,
 				full_text, request_correlation_id,
-				newapi_policy_status, newapi_platform, newapi_user_id, newapi_request_id, newapi_decision_id, session_hash
+				newapi_policy_status, newapi_platform, newapi_user_id, newapi_request_id, newapi_decision_id, session_hash, is_r18
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
 			RETURNING id, created_at
 		`, input.Source, input.Endpoint, input.Protocol, input.Provider, input.Model, input.Action, input.Mode, input.Score, input.AuditScore, input.Threshold,
 			input.PolicyProfile, input.ReasonCode, input.PrimaryOrigin, input.StrikeEligible, input.MatchedPatterns, input.TextPreview, input.MatchContext,
 			input.APIKeyID, input.APIKeyName, input.APIKeyMasked, input.ClientIP, input.ErrorCode, input.ReviewModel, input.ReviewFlagged, input.ReviewError,
 			input.Reviewed, input.ReviewConfidence, input.ReviewThreshold, input.ReviewReason, input.ReviewEndpoint, input.ReviewRequestMode, input.ReviewLatencyMS, input.FullText,
-			input.RequestCorrelationID, input.NewAPIPolicyStatus, input.NewAPIPlatform, input.NewAPIUserID, input.NewAPIRequestID, input.NewAPIDecisionID, input.SessionHash).Scan(&id, &createdRaw); err != nil {
+			input.RequestCorrelationID, input.NewAPIPolicyStatus, input.NewAPIPlatform, input.NewAPIUserID, input.NewAPIRequestID, input.NewAPIDecisionID, input.SessionHash,
+			isR18DBValue(input.IsR18)).Scan(&id, &createdRaw); err != nil {
 			return err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -725,7 +748,7 @@ func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogI
 			ReviewFlagged: input.ReviewFlagged, ReviewError: input.ReviewError, Reviewed: input.Reviewed,
 			ReviewConfidence: input.ReviewConfidence, ReviewThreshold: input.ReviewThreshold, ReviewReason: input.ReviewReason,
 			ReviewEndpoint: input.ReviewEndpoint, ReviewRequestMode: input.ReviewRequestMode, ReviewLatencyMS: input.ReviewLatencyMS,
-			RequestCorrelationID: input.RequestCorrelationID,
+			RequestCorrelationID: input.RequestCorrelationID, IsR18: input.IsR18,
 			NewAPIPolicyStatus:   input.NewAPIPolicyStatus, NewAPIPlatform: input.NewAPIPlatform, NewAPIUserID: input.NewAPIUserID,
 			NewAPIRequestID: input.NewAPIRequestID, NewAPIDecisionID: input.NewAPIDecisionID, SessionHash: input.SessionHash,
 			ClientIPHash: input.ClientIPHash,
@@ -786,7 +809,8 @@ func (db *DB) ListPromptFilterLogsPage(ctx context.Context, query PromptFilterLo
 		       review_confidence, review_threshold, COALESCE(review_reason, ''), COALESCE(review_endpoint, ''), COALESCE(review_request_mode, ''), review_latency_ms,
 		       COALESCE(full_text, ''),
 		       COALESCE(request_correlation_id, ''), COALESCE(newapi_policy_status, ''), COALESCE(newapi_platform, ''),
-		       COALESCE(newapi_user_id, ''), COALESCE(newapi_request_id, ''), COALESCE(newapi_decision_id, ''), COALESCE(session_hash, '')
+		       COALESCE(newapi_user_id, ''), COALESCE(newapi_request_id, ''), COALESCE(newapi_decision_id, ''), COALESCE(session_hash, ''),
+		       is_r18
 		FROM prompt_filter_logs
 		`+where+`
 		ORDER BY id DESC
@@ -801,14 +825,17 @@ func (db *DB) ListPromptFilterLogsPage(ctx context.Context, query PromptFilterLo
 	for rows.Next() {
 		item := &PromptFilterLog{}
 		var createdAtRaw interface{}
+		var isR18 sql.NullBool
 		if err := rows.Scan(&item.ID, &createdAtRaw, &item.Source, &item.Endpoint, &item.Protocol, &item.Provider, &item.Model, &item.Action, &item.Mode,
 			&item.Score, &item.AuditScore, &item.Threshold, &item.PolicyProfile, &item.ReasonCode, &item.PrimaryOrigin, &item.StrikeEligible,
 			&item.MatchedPatterns, &item.TextPreview, &item.MatchContext, &item.APIKeyID, &item.APIKeyName,
 			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.Reviewed,
 			&item.ReviewConfidence, &item.ReviewThreshold, &item.ReviewReason, &item.ReviewEndpoint, &item.ReviewRequestMode, &item.ReviewLatencyMS, &item.FullText,
-			&item.RequestCorrelationID, &item.NewAPIPolicyStatus, &item.NewAPIPlatform, &item.NewAPIUserID, &item.NewAPIRequestID, &item.NewAPIDecisionID, &item.SessionHash); err != nil {
+			&item.RequestCorrelationID, &item.NewAPIPolicyStatus, &item.NewAPIPlatform, &item.NewAPIUserID, &item.NewAPIRequestID, &item.NewAPIDecisionID, &item.SessionHash,
+			&isR18); err != nil {
 			return nil, 0, err
 		}
+		item.IsR18 = promptFilterNullableBool(isR18)
 		createdAt, err := parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, 0, err
@@ -914,7 +941,8 @@ func (db *DB) FindNearestPromptFilterLog(ctx context.Context, at time.Time, sour
 		       COALESCE(api_key_name, ''), COALESCE(api_key_masked, ''), COALESCE(client_ip, ''), COALESCE(error_code, ''),
 		       COALESCE(review_model, ''), COALESCE(review_flagged, false), COALESCE(review_error, ''), COALESCE(full_text, ''),
 		       COALESCE(request_correlation_id, ''), COALESCE(newapi_policy_status, ''), COALESCE(newapi_platform, ''),
-		       COALESCE(newapi_user_id, ''), COALESCE(newapi_request_id, ''), COALESCE(newapi_decision_id, ''), COALESCE(session_hash, '')
+		       COALESCE(newapi_user_id, ''), COALESCE(newapi_request_id, ''), COALESCE(newapi_decision_id, ''), COALESCE(session_hash, ''),
+		       is_r18
 		FROM prompt_filter_logs
 		WHERE `+strings.Join(clauses, " AND ")+`
 		ORDER BY id DESC
@@ -930,13 +958,16 @@ func (db *DB) FindNearestPromptFilterLog(ctx context.Context, at time.Time, sour
 	for rows.Next() {
 		item := &PromptFilterLog{}
 		var createdAtRaw interface{}
+		var isR18 sql.NullBool
 		if err := rows.Scan(&item.ID, &createdAtRaw, &item.Source, &item.Endpoint, &item.Protocol, &item.Provider, &item.Model, &item.Action, &item.Mode,
 			&item.Score, &item.AuditScore, &item.Threshold, &item.PolicyProfile, &item.ReasonCode, &item.PrimaryOrigin, &item.StrikeEligible,
 			&item.MatchedPatterns, &item.TextPreview, &item.MatchContext, &item.APIKeyID, &item.APIKeyName,
 			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.FullText,
-			&item.RequestCorrelationID, &item.NewAPIPolicyStatus, &item.NewAPIPlatform, &item.NewAPIUserID, &item.NewAPIRequestID, &item.NewAPIDecisionID, &item.SessionHash); err != nil {
+			&item.RequestCorrelationID, &item.NewAPIPolicyStatus, &item.NewAPIPlatform, &item.NewAPIUserID, &item.NewAPIRequestID, &item.NewAPIDecisionID, &item.SessionHash,
+			&isR18); err != nil {
 			return nil, err
 		}
+		item.IsR18 = promptFilterNullableBool(isR18)
 		createdAt, err := parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			continue

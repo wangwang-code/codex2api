@@ -5708,6 +5708,11 @@ function PromptReviewLogsTable({ logs }: { logs: PromptFilterLog[] }) {
                     <Badge variant={reviewFailed || log.review_flagged ? 'destructive' : 'default'}>
                       {reviewFailed ? t('promptFilter.reviewResultError') : log.review_flagged ? t('promptFilter.labels.reviewFlagged') : t('promptFilter.labels.reviewCleared')}
                     </Badge>
+                    {log.is_r18 === true ? (
+                      <Badge variant="secondary" title={t('promptFilter.labels.r18ExcludedHint')}>
+                        {t('promptFilter.labels.r18Content')}
+                      </Badge>
+                    ) : null}
                     <span className="font-mono text-xs">{moderationCategory ? `${moderationCategory} ` : ''}{confidence} / {threshold}</span>
                   </div>
                   {log.review_reason ? <p className="mt-2 text-xs leading-5">{log.review_reason}</p> : null}

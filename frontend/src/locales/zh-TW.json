@@ -1197,6 +1197,7 @@
         "account_routing_review": "檢查帳號路由"
       },
       "events": {
+        "r18_excluded": "成人內容（不計入風險）",
         "review_cleared": "複核通過",
         "review_flagged_monitor": "模型命中（監控模式）",
         "local_block_strike": "本地終局攔截",
@@ -1355,6 +1356,8 @@
       "strike": "計入違規",
       "upstream": "上游",
       "reviewFlagged": "審查判定違規",
+      "r18Content": "成人內容",
+      "r18ExcludedHint": "審核模型判定為成人內容。這類記錄仍會留檔，但不計入請求和身分風險畫像。",
       "reviewCleared": "審查判定通過"
     },
     "colScore": "執行 / 稽核",

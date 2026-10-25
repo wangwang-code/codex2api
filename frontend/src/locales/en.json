@@ -3128,6 +3128,7 @@
         "account_routing_review": "Review account routing"
       },
       "events": {
+        "r18_excluded": "Adult content (not scored)",
         "review_cleared": "Review cleared",
         "review_flagged_monitor": "Review flagged in monitor mode",
         "local_block_strike": "Terminal local block",
@@ -3902,6 +3903,8 @@
       "strike": "Strike eligible",
       "upstream": "Upstream",
       "reviewFlagged": "Review flagged",
+      "r18Content": "Adult",
+      "r18ExcludedHint": "The review model flagged this as adult content. The record is kept for audit, but it does not count toward request and identity risk profiling.",
       "reviewCleared": "Review cleared"
     },
     "rulesCatalogTitle": "Built-in Rules",

@@ -764,6 +764,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"prompt_filter_logs", "review_endpoint", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_request_mode", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_latency_ms", "INTEGER NULL"},
+		// 三态：NULL=审核没给这个字段（或没跑），0/1=模型的明确判定。
+		// 风险画像靠它排除 R18 命中，所以「未知」不能折叠成 0。
+		{"prompt_filter_logs", "is_r18", "INTEGER NULL"},
 		{"prompt_filter_logs", "full_text", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "match_context", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "audit_score", "INTEGER DEFAULT 0"},
