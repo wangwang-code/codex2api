@@ -120,7 +120,14 @@ func (h *Handler) UpsertPromptRiskTrustPolicy(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	if !profile.IsPerson || profile.NewAPIUserID == "" {
+	// api_key 画像的 is_person 是 false（它不是身份目录里的「人」），但一把
+	// shaft-{uid} 就是一个 uid。中间层给付费用户授信走的就是这个维度，
+	// 所以这里只要求「该主体类型可参与降频」，签名身份那条路仍要求是真人。
+	if !database.PromptRiskTrustAdaptiveSubjectEligible(subjectType) {
+		writeError(c, http.StatusBadRequest, "该画像维度不参与自适应降频")
+		return
+	}
+	if subjectType == database.PromptRiskSubjectNewAPIUser && (!profile.IsPerson || profile.NewAPIUserID == "") {
 		writeError(c, http.StatusBadRequest, "该画像不是可验证的人员身份")
 		return
 	}
@@ -151,7 +158,7 @@ func (h *Handler) UpsertPromptRiskTrustPolicy(c *gin.Context) {
 func (h *Handler) RevokePromptRiskTrustPolicy(c *gin.Context) {
 	subjectType := strings.TrimSpace(c.Param("subject_type"))
 	subjectKey := strings.TrimSpace(c.Param("subject_key"))
-	if subjectType != database.PromptRiskSubjectNewAPIUser || subjectKey == "" {
+	if !database.PromptRiskTrustAdaptiveSubjectEligible(subjectType) || subjectKey == "" {
 		writeError(c, http.StatusBadRequest, "自适应可信标识无效")
 		return
 	}

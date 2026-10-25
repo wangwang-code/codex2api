@@ -63,3 +63,50 @@ func TestPromptRiskTrustAdminGrantDetailAndRevoke(t *testing.T) {
 		t.Fatalf("revoke status=%d body=%s", revoke.Code, revoke.Body.String())
 	}
 }
+
+// 中间层给付费用户授信走 api_key 维度：一把 shaft-{uid} 就是一个 uid。
+// 这条路径必须能过接口；出口 IP 维度仍然被拒。
+func TestPromptRiskTrustAdminGrantsAPIKeySubject(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "admin-risk-trust-apikey.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	confidence := 0.1
+	if err := db.InsertPromptFilterLog(t.Context(), &database.PromptFilterLogInput{
+		Source: "local_filter", Action: "allow", ReviewModel: "review-model", ReviewConfidence: &confidence,
+		APIKeyID: 37, APIKeyName: "shaft-65550035", ClientIP: "203.0.113.9",
+	}); err != nil {
+		t.Fatalf("InsertPromptFilterLog: %v", err)
+	}
+	h := &Handler{db: db}
+	router := gin.New()
+	router.PUT("/api/admin/prompt-policy/risk-profiles/:subject_type/:subject_key/trust", h.UpsertPromptRiskTrustPolicy)
+	router.DELETE("/api/admin/prompt-policy/risk-profiles/:subject_type/:subject_key/trust", h.RevokePromptRiskTrustPolicy)
+
+	grant := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/prompt-policy/risk-profiles/api_key/37/trust",
+		strings.NewReader(`{"duration_hours":24,"risk_threshold":35,"reason":"pixshaft 付费用户连续 6 次干净翻译"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(grant, req)
+	if grant.Code != http.StatusOK || !strings.Contains(grant.Body.String(), `"status":"active"`) {
+		t.Fatalf("api_key grant status=%d body=%s", grant.Code, grant.Body.String())
+	}
+
+	// 出口 IP 维度必须仍然被拒——它后面可能是几十个互不相关的人。
+	ipGrant := httptest.NewRecorder()
+	ipReq := httptest.NewRequest(http.MethodPut, "/api/admin/prompt-policy/risk-profiles/client_ip/deadbeef/trust",
+		strings.NewReader(`{"duration_hours":24,"risk_threshold":35,"reason":"should be rejected"}`))
+	ipReq.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(ipGrant, ipReq)
+	if ipGrant.Code != http.StatusBadRequest {
+		t.Fatalf("client_ip grant status=%d body=%s（应当被拒）", ipGrant.Code, ipGrant.Body.String())
+	}
+
+	revoke := httptest.NewRecorder()
+	router.ServeHTTP(revoke, httptest.NewRequest(http.MethodDelete, "/api/admin/prompt-policy/risk-profiles/api_key/37/trust", nil))
+	if revoke.Code != http.StatusOK || !strings.Contains(revoke.Body.String(), `"status":"revoked"`) {
+		t.Fatalf("api_key revoke status=%d body=%s", revoke.Code, revoke.Body.String())
+	}
+}
