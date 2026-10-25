@@ -44,6 +44,38 @@ func promptBlockedMessage(cfg promptfilter.Config, verdict promptfilter.Verdict)
 	return localPromptBlockMessage(cfg)
 }
 
+// promptFilterR18Header carries the audit model's is_r18 verdict on a block
+// response. The calling middle layer uses it to tell an adult-content block —
+// expected traffic for a translation product — apart from a policy or injection
+// block, which it meters differently.
+const promptFilterR18Header = "X-Prompt-Filter-R18"
+
+func setPromptFilterR18Header(c *gin.Context, verdict promptfilter.Verdict) {
+	if c == nil || verdict.ReviewIsR18 == nil {
+		return
+	}
+	if *verdict.ReviewIsR18 {
+		c.Header(promptFilterR18Header, "true")
+		return
+	}
+	c.Header(promptFilterR18Header, "false")
+}
+
+// promptBlockedAPIError keeps the existing 400 envelope and adds is_r18 under
+// `details` when the audit model supplied it. The field is omitted when
+// unknown, so a caller that never sees it behaves exactly as before.
+func promptBlockedAPIError(cfg promptfilter.Config, verdict promptfilter.Verdict) *api.APIError {
+	apiErr := api.NewAPIError(
+		api.ErrorCode("prompt_blocked"),
+		promptBlockedMessage(cfg, verdict),
+		api.ErrorTypeInvalidRequest,
+	)
+	if verdict.ReviewIsR18 != nil {
+		apiErr.Details = map[string]any{"is_r18": *verdict.ReviewIsR18}
+	}
+	return apiErr
+}
+
 // promptFilterFullTextMaxRunes limits the persisted redacted blocked-request text preview.
 const promptFilterFullTextMaxRunes = 32000
 
@@ -111,15 +143,14 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 		return true
 	}
+	// Header first: writeBlock may replace the body with an endpoint-specific
+	// envelope, and the caller still needs the is_r18 signal.
+	setPromptFilterR18Header(c, verdict)
 	if writeBlock != nil {
 		writeBlock(c, strings.TrimSpace(cfg.Advanced.Enforcement.LocalBlockMessage))
 		return true
 	}
-	api.SendErrorWithStatus(c, api.NewAPIError(
-		api.ErrorCode("prompt_blocked"),
-		promptBlockedMessage(cfg, verdict),
-		api.ErrorTypeInvalidRequest,
-	), http.StatusBadRequest)
+	api.SendErrorWithStatus(c, promptBlockedAPIError(cfg, verdict), http.StatusBadRequest)
 	return true
 }
 
@@ -150,11 +181,8 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, []byte(text), endpoint, model, ingressRequestBody(c, nil)) {
 		return true
 	}
-	api.SendErrorWithStatus(c, api.NewAPIError(
-		api.ErrorCode("prompt_blocked"),
-		promptBlockedMessage(cfg, verdict),
-		api.ErrorTypeInvalidRequest,
-	), http.StatusBadRequest)
+	setPromptFilterR18Header(c, verdict)
+	api.SendErrorWithStatus(c, promptBlockedAPIError(cfg, verdict), http.StatusBadRequest)
 	return true
 }
 

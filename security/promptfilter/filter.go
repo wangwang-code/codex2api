@@ -135,6 +135,7 @@ type Verdict struct {
 	ReviewEndpoint      string   `json:"review_endpoint,omitempty"`
 	ReviewRequestMode   string   `json:"review_request_mode,omitempty"`
 	ReviewLatencyMS     *int64   `json:"review_latency_ms,omitempty"`
+	ReviewIsR18         *bool    `json:"review_is_r18,omitempty"`
 }
 
 type Engine struct {
