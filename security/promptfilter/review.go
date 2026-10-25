@@ -393,12 +393,20 @@ func parseReviewAPIKeys(raw string) []string {
 
 func (cfg ReviewConfig) Ready() bool {
 	cfg = NormalizeReviewConfig(cfg)
-	return cfg.Enabled && len(cfg.APIKeyList()) > 0 && cfg.BaseURL != ""
+	if !cfg.Enabled || cfg.BaseURL == "" {
+		return false
+	}
+	if len(cfg.APIKeyList()) > 0 {
+		return true
+	}
+	// 审核模型由本进程提供时没有跨进程边界要授权，密钥是多余的。这里放宽是
+	// 有条件的：只有内部执行器认领了这个 base URL 才成立，指到别处仍然需要 key。
+	return internalExecutorFor(cfg.BaseURL) != nil
 }
 
 func ValidateReviewConfig(cfg ReviewConfig) error {
 	cfg = NormalizeReviewConfig(cfg)
-	if cfg.Enabled && len(cfg.APIKeyList()) == 0 {
+	if cfg.Enabled && len(cfg.APIKeyList()) == 0 && internalExecutorFor(cfg.BaseURL) == nil {
 		return fmt.Errorf("at least one review api key is required when prompt filter review is enabled")
 	}
 	if cfg.BaseURL == "" {
@@ -563,6 +571,12 @@ func (c ReviewClient) ReviewTextDetailed(ctx context.Context, text string, cfg R
 	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
+	// 审核模型如果由本进程提供（base URL 指回自己），就走进程内短路：
+	// 不再用密钥绕一圈 HTTP，也不再需要那把「scope=off 的专用 key」。
+	// 注册缺失或 URL 指向别处时退回 HTTP —— 这是安全默认。
+	if exec := internalExecutorFor(cfg.BaseURL); exec != nil {
+		return c.reviewInternal(timeoutCtx, endpoint, payload, cfg, exec)
+	}
 	keys := cfg.APIKeyList()
 	start := reviewKeyCursor.Add(1) - 1
 	availableKeys, shortestCooldown := acquireReviewKeyCandidates(endpoint, cfg.Model, keys, start)
@@ -872,26 +886,70 @@ func (c ReviewClient) reviewOnce(ctx context.Context, endpoint, apiKey string, p
 	if err != nil {
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, err
 	}
-	if len(body) > maxReviewResponseBytes {
-		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, fmt.Errorf("review response exceeds %d bytes", maxReviewResponseBytes)
+	outcome, decodeErr := decodeReviewResponse(resp.StatusCode, strings.TrimSpace(resp.Header.Get("Content-Type")), body, cfg)
+	if decodeErr != nil {
+		var statusErr *reviewHTTPStatusError
+		if errors.As(decodeErr, &statusErr) {
+			return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, reviewStatusRetriable(resp.StatusCode), decodeErr
+		}
+		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, decodeErr
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, reviewStatusRetriable(resp.StatusCode), &reviewHTTPStatusError{
-			status: resp.StatusCode, contentType: contentType, summary: summarizeReviewHTTPBody(contentType, body),
+	outcome.Endpoint = endpoint
+	return outcome, false, nil
+}
+
+// decodeReviewResponse turns a (status, body) pair into a ReviewOutcome. Shared
+// by the HTTP transport and the in-process one so the two can never drift apart
+// on status handling, size limits, or response parsing.
+func decodeReviewResponse(status int, contentType string, body []byte, cfg ReviewConfig) (ReviewOutcome, error) {
+	if len(body) > maxReviewResponseBytes {
+		return ReviewOutcome{}, fmt.Errorf("review response exceeds %d bytes", maxReviewResponseBytes)
+	}
+	if status < 200 || status >= 300 {
+		return ReviewOutcome{}, &reviewHTTPStatusError{
+			status:      status,
+			contentType: contentType,
+			summary:     summarizeReviewHTTPBody(contentType, body),
 		}
 	}
-	var outcome ReviewOutcome
+	var (
+		outcome ReviewOutcome
+		err     error
+	)
 	if cfg.Adapter.RequestMode == ReviewRequestModeChatCompletions {
 		outcome, err = decodeChatReviewResponse(body, cfg)
 	} else {
 		outcome, err = decodeModerationReviewResponse(body, cfg)
 	}
 	if err != nil {
-		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, &reviewModelResponseError{err: err}
+		return ReviewOutcome{}, &reviewModelResponseError{err: err}
 	}
+	return outcome, nil
+}
+
+// reviewInternal runs the audit call inside this process. Key rotation is
+// skipped on purpose — there is no credential in the path — but the concurrency
+// slot and the circuit breaker stay, because they protect the upstream account
+// pool and the reviewer's own latency budget, not the key.
+func (c ReviewClient) reviewInternal(ctx context.Context, endpoint string, payload []byte, cfg ReviewConfig, exec InternalExecutor) (ReviewOutcome, error) {
+	release, err := acquireReviewSlot(ctx, endpoint, cfg.Adapter.MaxConcurrent)
+	if err != nil {
+		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, err
+	}
+	defer release()
+	circuitLease, err := acquireReviewCircuit(endpoint, cfg.Model, cfg.Adapter)
+	if err != nil {
+		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, err
+	}
+	status, body := exec.ExecuteChatCompletion(ctx, payload, ReviewInternalReason)
+	outcome, decodeErr := decodeReviewResponse(status, "application/json", body, cfg)
+	if decodeErr != nil {
+		completeReviewCircuit(circuitLease, decodeErr)
+		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, decodeErr
+	}
+	completeReviewCircuit(circuitLease, nil)
 	outcome.Endpoint = endpoint
-	return outcome, false, nil
+	return outcome, nil
 }
 
 // reviewStatusRetriable 判断某个 HTTP 状态码是否应切换到下一个 key 重试：

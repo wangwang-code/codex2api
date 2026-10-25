@@ -445,6 +445,9 @@ func main() {
 	// 从环境变量读取 Codex 画像与 Beta 配置。
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
+	// 审核模型由本进程提供时，让它走进程内短路，不再用密钥绕一圈 HTTP。
+	// 只有 base URL 指回本端口时 Handles() 才为真，指到别处仍走 HTTP。
+	promptfilter.RegisterInternalExecutor(proxy.InternalChatExecutor{Handler: handler, Port: cfg.Port})
 	handler.SetRuntimeCache(tc)
 	defer handler.CloseAPIKeyAuthCache()
 	adminHandler.SetAPIKeyAuthCacheHandler(handler)
