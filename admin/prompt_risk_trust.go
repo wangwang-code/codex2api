@@ -20,6 +20,10 @@ type promptRiskTrustPolicyRequest struct {
 	DurationHours int    `json:"duration_hours"`
 	RiskThreshold int    `json:"risk_threshold"`
 	Reason        string `json:"reason"`
+	// Source 留空等于 manual（管理员操作）。外部系统（翻译中间层）传
+	// provisional，表示这是一次「预授信」——时长较短，等 codex2api 观测够了
+	// 再升级成正式的 automatic 授信。
+	Source string `json:"source"`
 }
 
 func (h *Handler) startPromptRiskTrustSync(ctx context.Context) {
@@ -95,6 +99,16 @@ func (h *Handler) UpsertPromptRiskTrustPolicy(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请填写启用自适应可信策略的原因")
 		return
 	}
+	req.Source = strings.ToLower(strings.TrimSpace(req.Source))
+	switch req.Source {
+	case "":
+		req.Source = database.PromptRiskTrustSourceManual
+	case database.PromptRiskTrustSourceManual, database.PromptRiskTrustSourceProvisional:
+		// 允许。automatic 只能由后台自适应评估自己产生，不接受外部指定。
+	default:
+		writeError(c, http.StatusBadRequest, "可信策略来源只能是 manual 或 provisional")
+		return
+	}
 	if req.DurationHours <= 0 {
 		req.DurationHours = 24
 	}
@@ -135,9 +149,19 @@ func (h *Handler) UpsertPromptRiskTrustPolicy(c *gin.Context) {
 		writeError(c, http.StatusConflict, "当前画像风险已达到重新审核阈值，不能启用模型复核豁免")
 		return
 	}
+	requested := time.Now().UTC().Add(time.Duration(req.DurationHours) * time.Hour)
+	if req.Source == database.PromptRiskTrustSourceProvisional {
+		// 预授信只做「垫底」，不做「截断」：如果 codex2api 已经把这条升级成
+		// 更长的正式授信，中间层定时续期时不能把它打回 24 小时。
+		if existing, getErr := h.db.GetPromptRiskTrustPolicy(ctx, subjectType, subjectKey); getErr == nil &&
+			existing != nil && existing.Status == database.PromptRiskTrustStatusActive && existing.ValidUntil.After(requested) {
+			c.JSON(http.StatusOK, gin.H{"policy": existing, "shortened": false})
+			return
+		}
+	}
 	policy, err := h.db.UpsertPromptRiskTrustPolicy(ctx, database.PromptRiskTrustPolicyInput{
-		SubjectType: subjectType, SubjectKey: subjectKey, Reason: req.Reason,
-		RiskThreshold: req.RiskThreshold, ValidUntil: time.Now().UTC().Add(time.Duration(req.DurationHours) * time.Hour),
+		SubjectType: subjectType, SubjectKey: subjectKey, Reason: req.Reason, Source: req.Source,
+		RiskThreshold: req.RiskThreshold, ValidUntil: requested,
 	})
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())

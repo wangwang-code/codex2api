@@ -178,3 +178,71 @@ func TestAdaptiveReviewBasisCountsAPIKeyCleanReviews(t *testing.T) {
 		t.Fatalf("两条查询不一致：面板 %d，授信 %d", basis.CleanReviewCount, summary.CleanCount)
 	}
 }
+
+// 预授信要能被 codex2api 继续观测并升级：中间层凭付费身份给 24 小时，
+// 观测够格后自动换成正式授信（更长时长、source=automatic）。
+func TestProvisionalTrustEscalatesToAutomatic(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	confidence := 0.1
+
+	for i := 0; i < 10; i++ {
+		input := &PromptFilterLogInput{
+			Source: "local_filter", Endpoint: "/v1/chat/completions", Model: "gpt-6-luna",
+			Action: "allow", ReviewModel: "codex-auto-review", ReviewConfidence: &confidence,
+			ReviewReason: "正常翻译", APIKeyID: 55, APIKeyName: "shaft-55550035", ClientIP: "203.0.113.9",
+			ClientIPHash: promptRiskHash("client-ip", "203.0.113.9"),
+			RequestCorrelationID: fmt.Sprintf("corr-prov-%d", i), TextPreview: fmt.Sprintf("p-%d", i),
+		}
+		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
+			t.Fatalf("InsertPromptFilterLog: %v", err)
+		}
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_risk_events SET created_at=?`, time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("backdate events: %v", err)
+	}
+
+	// 中间层给的预授信：24 小时。
+	provisionalUntil := time.Now().UTC().Add(24 * time.Hour)
+	if _, err := db.UpsertPromptRiskTrustPolicy(ctx, PromptRiskTrustPolicyInput{
+		SubjectType: PromptRiskSubjectAPIKey, SubjectKey: "55", Source: PromptRiskTrustSourceProvisional,
+		Reason: "pixshaft 付费用户（pro）连续 6 次干净翻译，中间层授信", RiskThreshold: 35, ValidUntil: provisionalUntil,
+	}); err != nil {
+		t.Fatalf("预授信写入失败: %v", err)
+	}
+
+	// 人工策略不该被自动升级（对照组）。
+	if _, err := db.UpsertPromptRiskTrustPolicy(ctx, PromptRiskTrustPolicyInput{
+		SubjectType: PromptRiskSubjectAPIKey, SubjectKey: "56", Source: PromptRiskTrustSourceManual,
+		Reason: "管理员手工设置", RiskThreshold: 35, ValidUntil: provisionalUntil,
+	}); err != nil {
+		t.Fatalf("人工策略写入失败: %v", err)
+	}
+
+	policies, err := db.ReconcileAdaptivePromptRiskTrustPolicies(ctx, PromptRiskTrustAdaptiveOptions{
+		MinCleanReviews: 3, MinObservationHours: 1, TrustDurationHours: 168,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileAdaptivePromptRiskTrustPolicies: %v", err)
+	}
+
+	var escalated *PromptRiskTrustPolicy
+	for _, policy := range policies {
+		if policy.SubjectKey == "55" {
+			escalated = policy
+		}
+		if policy.SubjectKey == "56" && policy.Source != PromptRiskTrustSourceManual {
+			t.Fatalf("人工策略被自动改写了: %+v", policy)
+		}
+	}
+	if escalated == nil {
+		t.Fatalf("预授信策略不见了: %+v", policies)
+	}
+	if escalated.Source != PromptRiskTrustSourceAutomatic {
+		t.Fatalf("预授信未升级，source = %q", escalated.Source)
+	}
+	hours := escalated.ValidUntil.Sub(time.Now().UTC()).Hours()
+	if hours < 167 || hours > 169 {
+		t.Fatalf("升级后时长 = %.1fh，期望约 168h（预授信 24h 应被拉长）", hours)
+	}
+}

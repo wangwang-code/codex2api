@@ -17,9 +17,14 @@ const (
 	PromptRiskTrustStatusExpired   = "expired"
 	PromptRiskTrustSourceManual    = "manual"
 	PromptRiskTrustSourceAutomatic = "automatic"
+	// PromptRiskTrustSourceProvisional 是「预授信」：外部系统（翻译中间层）
+	// 凭付费身份给的临时豁免，时长短。codex2api 继续观测，够格就升级成 automatic。
+	PromptRiskTrustSourceProvisional = "provisional"
 
 	PromptRiskTrustEventGranted       = "granted"
 	PromptRiskTrustEventAutoGranted   = "auto_granted"
+	PromptRiskTrustEventPreGranted    = "pre_granted"
+	PromptRiskTrustEventEscalated     = "escalated"
 	PromptRiskTrustEventReactivated   = "reactivated"
 	PromptRiskTrustEventSuspended     = "suspended"
 	PromptRiskTrustEventAutoSuspended = "auto_suspended"
@@ -222,7 +227,8 @@ func normalizePromptRiskTrustInput(input PromptRiskTrustPolicyInput) (PromptRisk
 	if input.Source == "" {
 		input.Source = PromptRiskTrustSourceManual
 	}
-	if input.Source != PromptRiskTrustSourceManual && input.Source != PromptRiskTrustSourceAutomatic {
+	if input.Source != PromptRiskTrustSourceManual && input.Source != PromptRiskTrustSourceAutomatic &&
+		input.Source != PromptRiskTrustSourceProvisional {
 		return input, errors.New("adaptive trust source is invalid")
 	}
 	if !PromptRiskTrustAdaptiveSubjectEligible(input.SubjectType) || input.SubjectKey == "" {
@@ -259,8 +265,8 @@ func (db *DB) UpsertPromptRiskTrustPolicy(ctx context.Context, raw PromptRiskTru
 		return nil, err
 	}
 	defer tx.Rollback()
-	previous := ""
-	_ = tx.QueryRowContext(ctx, `SELECT status FROM prompt_risk_trust_policies WHERE subject_key=$1`, input.SubjectKey).Scan(&previous)
+	previous, previousSource := "", ""
+	_ = tx.QueryRowContext(ctx, `SELECT status, source FROM prompt_risk_trust_policies WHERE subject_key=$1`, input.SubjectKey).Scan(&previous, &previousSource)
 	_, err = tx.ExecContext(ctx, `INSERT INTO prompt_risk_trust_policies (
 		subject_type, subject_key, status, source, reason, risk_threshold, valid_until, last_model_review_at, updated_at
 	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_TIMESTAMP)
@@ -278,10 +284,15 @@ func (db *DB) UpsertPromptRiskTrustPolicy(ctx context.Context, raw PromptRiskTru
 		return nil, err
 	}
 	eventType := PromptRiskTrustEventGranted
-	if input.Source == PromptRiskTrustSourceAutomatic && previous == "" {
+	switch {
+	case previous == "" && input.Source == PromptRiskTrustSourceAutomatic:
 		eventType = PromptRiskTrustEventAutoGranted
-	}
-	if previous != "" {
+	case previous == "" && input.Source == PromptRiskTrustSourceProvisional:
+		eventType = PromptRiskTrustEventPreGranted
+	case previous != "" && previousSource == PromptRiskTrustSourceProvisional && input.Source == PromptRiskTrustSourceAutomatic:
+		// 预授信观测期通过，升级成正式授信——这是最该在审计里看见的一条。
+		eventType = PromptRiskTrustEventEscalated
+	case previous != "":
 		eventType = PromptRiskTrustEventReactivated
 	}
 	if err := insertPromptRiskTrustEvent(ctx, tx, policyID, input.SubjectType, input.SubjectKey, eventType, input.Reason, 0, "", ""); err != nil {
@@ -660,10 +671,12 @@ func (db *DB) ReconcileAdaptivePromptRiskTrustPolicies(ctx context.Context, raw 
 		if profile.SubjectType == PromptRiskSubjectNewAPIUser && !profile.IsPerson {
 			continue
 		}
-		if policy != nil && policy.Status == PromptRiskTrustStatusActive {
+		// 正式授信（automatic）已经在生效，不必重复授予；人工策略不自动改写。
+		// 预授信例外：它就是要被继续观测、够格升级成正式授信的那一类。
+		if policy != nil && policy.Status == PromptRiskTrustStatusActive && policy.Source != PromptRiskTrustSourceProvisional {
 			continue
 		}
-		if policy != nil && policy.Source != PromptRiskTrustSourceAutomatic {
+		if policy != nil && policy.Source == PromptRiskTrustSourceManual {
 			continue
 		}
 		eligible := evidence.CleanCount >= options.MinCleanReviews && evidence.PositiveCount == 0 && evidence.FirstCleanAt != nil &&
@@ -686,6 +699,9 @@ func (db *DB) ReconcileAdaptivePromptRiskTrustPolicies(ctx context.Context, raw 
 			continue
 		}
 		reason := "稳定低风险画像自动降低同步模型复核频率"
+		if policy != nil && policy.Source == PromptRiskTrustSourceProvisional {
+			reason = "预授信观测期通过，升级为正式自适应授信"
+		}
 		_, err = db.UpsertPromptRiskTrustPolicy(ctx, PromptRiskTrustPolicyInput{
 			SubjectType: evidence.SubjectType, SubjectKey: evidence.SubjectKey, Source: PromptRiskTrustSourceAutomatic,
 			Reason: reason, RiskThreshold: options.RiskThreshold,

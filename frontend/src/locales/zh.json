@@ -3045,7 +3045,7 @@
         "bypassCount": "已节省同步复核",
         "lastEvaluation": "最近周期评判",
         "source": "策略来源",
-        "sources": {
+        "sources": {"provisional": "外部预授信（付费身份）", 
           "manual": "管理员设置",
           "automatic": "画像自动启用"
         },
@@ -3093,6 +3093,8 @@
         "events": {
           "granted": "已启用",
           "auto_granted": "画像自动启用",
+          "pre_granted": "预授信（待观测升级）",
+          "escalated": "预授信升级为正式授信",
           "reactivated": "重新启用",
           "suspended": "已暂停",
           "auto_suspended": "风险触发自动暂停",

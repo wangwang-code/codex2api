@@ -1116,7 +1116,8 @@
         "source": "策略來源",
         "sources": {
           "manual": "管理員設定",
-          "automatic": "畫像自動啟用"
+          "automatic": "畫像自動啟用",
+          "provisional": "外部預授信（付費身分）"
         },
         "modelReviewCount": "週期模型複核次數",
         "lastModelReview": "最近模型複核",
@@ -1162,6 +1163,8 @@
         "events": {
           "granted": "已啟用",
           "auto_granted": "畫像自動啟用",
+          "pre_granted": "預授信（待觀測升級）",
+          "escalated": "預授信升級為正式授信",
           "reactivated": "重新啟用",
           "suspended": "已暫停",
           "auto_suspended": "風險觸發自動暫停",

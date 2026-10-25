@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
@@ -108,5 +109,60 @@ func TestPromptRiskTrustAdminGrantsAPIKeySubject(t *testing.T) {
 	router.ServeHTTP(revoke, httptest.NewRequest(http.MethodDelete, "/api/admin/prompt-policy/risk-profiles/api_key/37/trust", nil))
 	if revoke.Code != http.StatusOK || !strings.Contains(revoke.Body.String(), `"status":"revoked"`) {
 		t.Fatalf("api_key revoke status=%d body=%s", revoke.Code, revoke.Body.String())
+	}
+}
+
+// 预授信只做「垫底」不做「截断」：codex2api 已经把这条升级成更长的正式授信后，
+// 中间层定时续期不能把它打回 24 小时。
+func TestPromptRiskTrustProvisionalDoesNotShorten(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "admin-risk-trust-prov.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	confidence := 0.1
+	if err := db.InsertPromptFilterLog(t.Context(), &database.PromptFilterLogInput{
+		Source: "local_filter", Action: "allow", ReviewModel: "review-model", ReviewConfidence: &confidence,
+		APIKeyID: 77, APIKeyName: "shaft-77777777", ClientIP: "203.0.113.9",
+	}); err != nil {
+		t.Fatalf("InsertPromptFilterLog: %v", err)
+	}
+
+	// 模拟「已被升级成 7 天」的正式授信。
+	if _, err := db.UpsertPromptRiskTrustPolicy(t.Context(), database.PromptRiskTrustPolicyInput{
+		SubjectType: database.PromptRiskSubjectAPIKey, SubjectKey: "77", Source: database.PromptRiskTrustSourceAutomatic,
+		Reason: "预授信观测期通过，升级为正式自适应授信", RiskThreshold: 35,
+		ValidUntil: time.Now().UTC().Add(168 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertPromptRiskTrustPolicy: %v", err)
+	}
+
+	h := &Handler{db: db}
+	router := gin.New()
+	router.PUT("/api/admin/prompt-policy/risk-profiles/:subject_type/:subject_key/trust", h.UpsertPromptRiskTrustPolicy)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/admin/prompt-policy/risk-profiles/api_key/77/trust",
+		strings.NewReader(`{"duration_hours":24,"risk_threshold":35,"reason":"中间层续期","source":"provisional"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("provisional renew status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"shortened":false`) {
+		t.Fatalf("应当报告未缩短: %s", rec.Body.String())
+	}
+
+	policy, err := db.GetPromptRiskTrustPolicy(t.Context(), database.PromptRiskSubjectAPIKey, "77")
+	if err != nil {
+		t.Fatalf("GetPromptRiskTrustPolicy: %v", err)
+	}
+	hours := policy.ValidUntil.Sub(time.Now().UTC()).Hours()
+	if hours < 167 || hours > 169 {
+		t.Fatalf("续期把 168h 打成了 %.1fh", hours)
+	}
+	if policy.Source != database.PromptRiskTrustSourceAutomatic {
+		t.Fatalf("来源被改回 %q", policy.Source)
 	}
 }

@@ -3045,7 +3045,7 @@
         "bypassCount": "Synchronous reviews saved",
         "lastEvaluation": "Latest periodic evaluation",
         "source": "Policy source",
-        "sources": {
+        "sources": {"provisional": "External pre-grant (paid identity)", 
           "manual": "Administrator",
           "automatic": "Automatic profile decision"
         },
@@ -3093,6 +3093,8 @@
         "events": {
           "granted": "Enabled",
           "auto_granted": "Automatically enabled",
+          "pre_granted": "Pre-granted (awaiting observation)",
+          "escalated": "Pre-grant escalated to full trust",
           "reactivated": "Re-enabled",
           "suspended": "Suspended",
           "auto_suspended": "Risk-triggered suspension",
