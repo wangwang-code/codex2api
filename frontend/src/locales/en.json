@@ -3667,6 +3667,16 @@
       "local_blocks": "Local block decisions only"
     },
     "reviewConfidenceThreshold": "Violation Confidence Threshold",
+    "reviewReasoningEffort": "Reasoning Effort",
+    "reviewReasoningEffortHint": "The reviewer classifies; it does not solve. The upstream default effort makes it over-think and read ordinary numbers or code fragments as JSON that needs analysing, which is how benign input gets blocked. \"Off\" is the safe choice for a classifier.",
+    "reviewReasoningEffortOptions": {
+      "default": "Upstream default",
+      "none": "Off (none)",
+      "minimal": "Minimal",
+      "low": "Low",
+      "medium": "Medium",
+      "high": "High"
+    },
     "moderationThresholds": "Risk thresholds",
     "moderationThresholdsHint": "A Moderations category is matched when its score is greater than or equal to the configured threshold. The provider's flagged boolean is not used for enforcement.",
     "moderationThresholdsReset": "Restore default thresholds",

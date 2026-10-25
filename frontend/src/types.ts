@@ -2810,6 +2810,7 @@ export interface PromptReviewTestRequest {
   timeout_seconds: number
   max_concurrent: number
   max_text_length: number
+  reasoning_effort?: string
   test_all_keys?: boolean
 }
 

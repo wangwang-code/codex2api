@@ -878,6 +878,16 @@
       "local_blocks": "僅本機攔截判定"
     },
     "reviewConfidenceThreshold": "違規信心閾值",
+    "reviewReasoningEffort": "思考檔位",
+    "reviewReasoningEffortHint": "審核只做分類，不是解題。跟隨上游預設檔位時模型容易過度思考，把一般數值或程式碼片段當成需要分析的 JSON 結構，進而誤判正常輸入。「關閉」是分類場景下的穩妥做法。",
+    "reviewReasoningEffortOptions": {
+      "default": "跟隨上游預設",
+      "none": "關閉（none）",
+      "minimal": "極低（minimal）",
+      "low": "低（low）",
+      "medium": "中（medium）",
+      "high": "高（high）"
+    },
     "moderationThresholds": "風險閾值",
     "moderationThresholdsHint": "依內容風險類型調整命中閾值，分數達到或超過閾值即視為命中。括號內保留上游 Moderations 英文分類識別碼，便於介面排查。",
     "moderationThresholdsReset": "恢復預設閾值",

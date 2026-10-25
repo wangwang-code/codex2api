@@ -3667,6 +3667,16 @@
       "local_blocks": "仅本地拦截判定"
     },
     "reviewConfidenceThreshold": "违规置信度阈值",
+    "reviewReasoningEffort": "思考档位",
+    "reviewReasoningEffortHint": "审核只做分类，不是解题。跟随上游默认档位时模型容易过度思考，把普通数值或代码片段当成需要分析的 JSON 结构，进而误判正常输入。「关闭」是分类场景下的稳妥选择。",
+    "reviewReasoningEffortOptions": {
+      "default": "跟随上游默认",
+      "none": "关闭（none）",
+      "minimal": "极低（minimal）",
+      "low": "低（low）",
+      "medium": "中（medium）",
+      "high": "高（high）"
+    },
     "moderationThresholds": "风险阈值",
     "moderationThresholdsHint": "按内容风险类型调整命中阈值，分数达到或超过阈值即视为命中。括号内保留上游 Moderations 英文分类标识，便于接口排查。",
     "moderationThresholdsReset": "恢复默认阈值",

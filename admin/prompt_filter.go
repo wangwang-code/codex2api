@@ -103,6 +103,7 @@ type promptReviewTestRequest struct {
 	TimeoutSeconds       int                `json:"timeout_seconds"`
 	MaxConcurrent        int                `json:"max_concurrent"`
 	MaxTextLength        int                `json:"max_text_length"`
+	ReasoningEffort      string             `json:"reasoning_effort"`
 	TestAllKeys          bool               `json:"test_all_keys"`
 }
 
@@ -929,6 +930,7 @@ func (h *Handler) TestPromptReviewConnection(c *gin.Context) {
 		ModerationThresholds: req.ModerationThresholds,
 		MaxConcurrent:        req.MaxConcurrent,
 		MaxTextLength:        req.MaxTextLength,
+		ReasoningEffort:      req.ReasoningEffort,
 	}
 	reviewCfg = promptfilter.NormalizeReviewConfig(reviewCfg)
 	if err := promptfilter.ValidateReviewConfig(reviewCfg); err != nil {

@@ -110,6 +110,17 @@ type CustomRuleDraft = {
   strict: boolean
 }
 
+// 审核只做分类，不是解题：显式钉住思考档位，避免上游默认档位让模型过度思考，
+// 把普通数值/代码片段当成需要分析的 JSON 结构而误判为违规。
+const reviewReasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high'] as const
+type ReviewReasoningEffort = '' | (typeof reviewReasoningEfforts)[number]
+
+function parseReviewReasoningEffort(raw: unknown): ReviewReasoningEffort {
+  return typeof raw === 'string' && (reviewReasoningEfforts as readonly string[]).includes(raw)
+    ? (raw as ReviewReasoningEffort)
+    : ''
+}
+
 type ReviewAdapterFormConfig = {
   request_mode: 'moderations' | 'chat_completions'
   scope: 'all_requests' | 'local_candidates' | 'local_blocks'
@@ -117,6 +128,7 @@ type ReviewAdapterFormConfig = {
   user_prompt_template: string
   payload_template: string
   confidence_threshold: number
+  reasoning_effort: ReviewReasoningEffort
   moderation_thresholds: Record<string, number>
   max_concurrent: number
   max_text_length: number
@@ -141,6 +153,7 @@ const defaultReviewAdapter: ReviewAdapterFormConfig = {
   user_prompt_template: '',
   payload_template: '',
   confidence_threshold: 0.7,
+  reasoning_effort: '',
   moderation_thresholds: {
     harassment: 0.98,
     'harassment/threatening': 0.90,
@@ -185,6 +198,7 @@ function parseReviewAdapter(value: AdvancedConfigObject): ReviewAdapterFormConfi
     user_prompt_template: typeof raw.user_prompt_template === 'string' && raw.user_prompt_template.trim() ? raw.user_prompt_template : defaultReviewAdapter.user_prompt_template,
     payload_template: typeof raw.payload_template === 'string' ? raw.payload_template : '',
     confidence_threshold: typeof raw.confidence_threshold === 'number' && raw.confidence_threshold > 0 && raw.confidence_threshold <= 1 ? raw.confidence_threshold : defaultReviewAdapter.confidence_threshold,
+    reasoning_effort: parseReviewReasoningEffort(raw.reasoning_effort),
     moderation_thresholds: moderationThresholds,
     max_concurrent: typeof raw.max_concurrent === 'number' && raw.max_concurrent > 0 ? raw.max_concurrent : defaultReviewAdapter.max_concurrent,
     max_text_length: typeof raw.max_text_length === 'number' && raw.max_text_length > 0 ? raw.max_text_length : defaultReviewAdapter.max_text_length,
@@ -3068,6 +3082,7 @@ function OverviewView({
         user_prompt_template: reviewAdapter.user_prompt_template,
         payload_template: reviewAdapter.payload_template,
         confidence_threshold: reviewAdapter.confidence_threshold,
+        reasoning_effort: reviewAdapter.reasoning_effort || undefined,
         moderation_thresholds: reviewAdapter.moderation_thresholds,
         timeout_seconds: form.prompt_filter_review_timeout_seconds,
         max_concurrent: reviewAdapter.max_concurrent,
@@ -3541,6 +3556,18 @@ function OverviewView({
                     <Field label={t('promptFilter.reviewRequestMode')}><Select value={reviewAdapter.request_mode} onValueChange={(value) => updateReviewAdapter('request_mode', value as ReviewAdapterFormConfig['request_mode'])} options={[{ label: t('promptFilter.reviewModeChat'), value: 'chat_completions' }, { label: t('promptFilter.reviewModeModerations'), value: 'moderations' }]} /></Field>
                     <Field label={t('promptFilter.reviewScope')}><Select value={reviewAdapter.scope} onValueChange={(value) => updateReviewAdapter('scope', value as ReviewAdapterFormConfig['scope'])} options={(['all_requests', 'local_candidates', 'local_blocks'] as ReviewAdapterFormConfig['scope'][]).map((scope) => ({ label: t(`promptFilter.reviewScopeOptions.${scope}`), value: scope }))} /></Field>
                     {reviewAdapter.request_mode === 'chat_completions' ? <Field label={t('promptFilter.reviewConfidenceThreshold')}><DraftNumberInput integer={false} step="0.01" min={0.01} max={1} value={reviewAdapter.confidence_threshold} onValueChange={(value) => updateReviewAdapter('confidence_threshold', value)} /></Field> : null}
+                    {reviewAdapter.request_mode === 'chat_completions' ? (
+                      <Field label={t('promptFilter.reviewReasoningEffort')} hint={t('promptFilter.reviewReasoningEffortHint')}>
+                        <Select
+                          value={reviewAdapter.reasoning_effort || 'default'}
+                          onValueChange={(value) => updateReviewAdapter('reasoning_effort', value === 'default' ? '' : (value as ReviewReasoningEffort))}
+                          options={[
+                            { label: t('promptFilter.reviewReasoningEffortOptions.default'), value: 'default' },
+                            ...reviewReasoningEfforts.map((effort) => ({ label: t(`promptFilter.reviewReasoningEffortOptions.${effort}`), value: effort })),
+                          ]}
+                        />
+                      </Field>
+                    ) : null}
                   </div>
                   {reviewAdapter.request_mode === 'moderations' ? (
                     <div className="space-y-3 rounded-lg border bg-muted/20 p-4">

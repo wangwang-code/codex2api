@@ -162,6 +162,11 @@ type ReviewAdapterConfig struct {
 	UserPromptTemplate     string             `json:"user_prompt_template"`
 	PayloadTemplate        string             `json:"payload_template"`
 	ConfidenceThreshold    float64            `json:"confidence_threshold"`
+	// ReasoningEffort 显式指定审核模型的思考档位（none/minimal/low/medium/high）。
+	// 审核是一次分类，不是解题：不设档位时上游默认档位会让模型过度思考，把
+	// 普通数值、代码片段当成需要分析的 JSON 结构，从而误判为违规。空串表示
+	// 不干预报文（沿用上游默认），保持对既有部署的向后兼容。
+	ReasoningEffort        string             `json:"reasoning_effort,omitempty"`
 	ModerationThresholds   map[string]float64 `json:"moderation_thresholds"`
 	MaxConcurrent          int                `json:"max_concurrent"`
 	MaxTextLength          int                `json:"max_text_length"`
@@ -315,6 +320,7 @@ func NormalizeReviewAdapterConfig(cfg ReviewAdapterConfig) ReviewAdapterConfig {
 	if cfg.ConfidenceThreshold <= 0 || cfg.ConfidenceThreshold > 1 {
 		cfg.ConfidenceThreshold = DefaultReviewConfidence
 	}
+	cfg.ReasoningEffort = normalizeReviewReasoningEffort(cfg.ReasoningEffort)
 	cfg.ModerationThresholds = normalizeReviewModerationThresholds(cfg.ModerationThresholds)
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = DefaultReviewMaxConcurrent
@@ -1220,7 +1226,7 @@ func buildReviewPayload(text string, cfg ReviewConfig) ([]byte, error) {
 	userPrompt := strings.ReplaceAll(cfg.Adapter.UserPromptTemplate, "{{text}}", text)
 	if strings.TrimSpace(cfg.Adapter.PayloadTemplate) == "" {
 		if cfg.Adapter.RequestMode == ReviewRequestModeChatCompletions {
-			return json.Marshal(map[string]any{
+			body := map[string]any{
 				"model": cfg.Model,
 				"messages": []map[string]string{
 					{"role": "system", "content": systemPrompt},
@@ -1228,7 +1234,9 @@ func buildReviewPayload(text string, cfg ReviewConfig) ([]byte, error) {
 				},
 				"temperature": 0,
 				"stream":      false,
-			})
+			}
+			applyReviewReasoningEffort(body, cfg.Adapter.ReasoningEffort)
+			return json.Marshal(body)
 		}
 		return json.Marshal(reviewRequest{Model: cfg.Model, Input: text})
 	}
@@ -1252,7 +1260,37 @@ func buildReviewPayload(text string, cfg ReviewConfig) ([]byte, error) {
 		"{{text}}", text,
 	)
 	payload = replaceReviewPayloadPlaceholders(payload, replacer)
+	if object, ok := payload.(map[string]any); ok {
+		applyReviewReasoningEffort(object, cfg.Adapter.ReasoningEffort)
+	}
 	return json.Marshal(payload)
+}
+
+// applyReviewReasoningEffort 把显式档位写进 chat-completions 报文。
+// 自定义 payload_template 里已经写了 reasoning 时不覆盖 —— 模板是更具体的
+// 意图，配置项只负责补默认值。
+func applyReviewReasoningEffort(body map[string]any, effort string) {
+	if body == nil {
+		return
+	}
+	effort = normalizeReviewReasoningEffort(effort)
+	if effort == "" {
+		return
+	}
+	if _, exists := body["reasoning"]; exists {
+		return
+	}
+	body["reasoning"] = map[string]string{"effort": effort}
+}
+
+// normalizeReviewReasoningEffort 只放行上游认识的档位；其余一律视为「不干预」，
+// 避免把拼错的配置悄悄变成一次无效请求。
+func normalizeReviewReasoningEffort(raw string) string {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "none", "minimal", "low", "medium", "high":
+		return value
+	}
+	return ""
 }
 
 func reviewSystemPromptForRequest(configured string) string {
