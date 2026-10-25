@@ -13,12 +13,55 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // internalChatReasonAuditReview tags usage_logs.internal_reason for the prompt
 // audit model call, so the review traffic stays separable from real users in
 // the usage table.
 const internalChatReasonAuditReview = "prompt_audit_review"
+
+// internalReasoningEffortKey carries the reviewer's declared effort from the
+// internal entry point down to the executor.
+//
+// It cannot simply ride in the inbound body: the chat body is rebuilt into the
+// upstream (Responses-shaped) payload on the way down, and `reasoning` does not
+// survive that rebuild. Payload rules work precisely because they run *after*
+// it (executor.go, ApplyPayloadRulesToBody) — so the reviewer's effort is
+// applied at the same point, which is also why an equivalent payload rule used
+// to have the intended effect.
+type internalReasoningEffortKey struct{}
+
+// ApplyInternalReasoningEffort stamps the declared effort onto the final
+// upstream body. A value already present (from payload rules or the caller's own
+// body) wins: an explicit rule stays the most specific instruction.
+func ApplyInternalReasoningEffort(ctx context.Context, body []byte) []byte {
+	if ctx == nil || len(body) == 0 {
+		return body
+	}
+	effort, _ := ctx.Value(internalReasoningEffortKey{}).(string)
+	effort = normalizeInternalReasoningEffort(effort)
+	if effort == "" {
+		return body
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()) != "" {
+		return body
+	}
+	updated, err := sjson.SetBytes(body, "reasoning.effort", effort)
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+func normalizeInternalReasoningEffort(raw string) string {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "none", "minimal", "low", "medium", "high":
+		return value
+	}
+	return ""
+}
 
 // ExecuteInternalChatCompletion runs one /v1/chat/completions request inside the
 // process and returns the same (status, body) pair the wire would have carried.
@@ -34,16 +77,16 @@ const internalChatReasonAuditReview = "prompt_audit_review"
 // upstream call, retries, usage accounting — and skips only the two steps that
 // only make sense for an external caller: inbound API-key auth and the inbound
 // prompt filter (which would otherwise recurse).
-func (h *Handler) ExecuteInternalChatCompletion(ctx context.Context, body []byte, reason string) (int, []byte) {
-	return h.executeInternalChatWithAttribution(ctx, body, nil, reason)
+func (h *Handler) ExecuteInternalChatCompletion(ctx context.Context, body []byte, reason string, reasoningEffort string) (int, []byte) {
+	return h.executeInternalChatWithAttribution(ctx, body, nil, reason, reasoningEffort)
 }
 
 // ExecuteInternalChatCompletionForAPIKey is the attributed variant: routing and
 // usage are charged to the given gateway key while the raw credential is never
 // copied into the child request.
-func (h *Handler) ExecuteInternalChatCompletionForAPIKey(ctx context.Context, body []byte, row *database.APIKeyRow, reason string) (int, []byte) {
+func (h *Handler) ExecuteInternalChatCompletionForAPIKey(ctx context.Context, body []byte, row *database.APIKeyRow, reason string, reasoningEffort string) (int, []byte) {
 	if row == nil {
-		return h.ExecuteInternalChatCompletion(ctx, body, reason)
+		return h.ExecuteInternalChatCompletion(ctx, body, reason, reasoningEffort)
 	}
 	return h.executeInternalChatWithAttribution(ctx, body, &internalResponseAttribution{
 		APIKeyID:     row.ID,
@@ -51,15 +94,18 @@ func (h *Handler) ExecuteInternalChatCompletionForAPIKey(ctx context.Context, bo
 		APIKeyMasked: security.MaskAPIKey(row.Key),
 		APIKeyRow:    row,
 		Reason:       reason,
-	}, reason)
+	}, reason, reasoningEffort)
 }
 
-func (h *Handler) executeInternalChatWithAttribution(ctx context.Context, body []byte, attribution *internalResponseAttribution, reason string) (int, []byte) {
+func (h *Handler) executeInternalChatWithAttribution(ctx context.Context, body []byte, attribution *internalResponseAttribution, reason string, reasoningEffort string) (int, []byte) {
 	if h == nil {
 		return http.StatusServiceUnavailable, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if effort := normalizeInternalReasoningEffort(reasoningEffort); effort != "" {
+		ctx = context.WithValue(ctx, internalReasoningEffortKey{}, effort)
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -119,9 +165,9 @@ func (e InternalChatExecutor) Handles(baseURL string) bool {
 	return false
 }
 
-func (e InternalChatExecutor) ExecuteChatCompletion(ctx context.Context, body []byte, reason string) (int, []byte) {
+func (e InternalChatExecutor) ExecuteChatCompletion(ctx context.Context, body []byte, reason string, reasoningEffort string) (int, []byte) {
 	if strings.TrimSpace(reason) == "" {
 		reason = internalChatReasonAuditReview
 	}
-	return e.Handler.ExecuteInternalChatCompletion(ctx, body, reason)
+	return e.Handler.ExecuteInternalChatCompletion(ctx, body, reason, reasoningEffort)
 }

@@ -21,7 +21,7 @@ const ReviewInternalReason = "prompt_audit_review"
 // different host must keep going over HTTP.
 type InternalExecutor interface {
 	Handles(baseURL string) bool
-	ExecuteChatCompletion(ctx context.Context, body []byte, reason string) (status int, respBody []byte)
+	ExecuteChatCompletion(ctx context.Context, body []byte, reason string, reasoningEffort string) (status int, respBody []byte)
 }
 
 type internalExecutorHolder struct {

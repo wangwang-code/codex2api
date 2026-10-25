@@ -15,9 +15,10 @@ import (
 type fakeInternalExecutor struct {
 	mu       sync.Mutex
 	handles  string
-	calls    int
-	lastBody []byte
-	lastWhy  string
+	calls      int
+	lastBody   []byte
+	lastWhy    string
+	lastEffort string
 	status   int
 	respBody []byte
 }
@@ -26,12 +27,13 @@ func (f *fakeInternalExecutor) Handles(baseURL string) bool {
 	return strings.Contains(baseURL, f.handles)
 }
 
-func (f *fakeInternalExecutor) ExecuteChatCompletion(_ context.Context, body []byte, reason string) (int, []byte) {
+func (f *fakeInternalExecutor) ExecuteChatCompletion(_ context.Context, body []byte, reason string, reasoningEffort string) (int, []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastBody = append([]byte(nil), body...)
 	f.lastWhy = reason
+	f.lastEffort = reasoningEffort
 	return f.status, f.respBody
 }
 

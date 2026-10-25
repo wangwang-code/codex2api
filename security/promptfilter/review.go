@@ -563,7 +563,7 @@ func (c ReviewClient) ReviewTextDetailed(ctx context.Context, text string, cfg R
 	if strings.TrimSpace(text) == "" {
 		return ReviewOutcome{Model: cfg.Model}, nil
 	}
-	text = truncateReviewText(text, cfg.Adapter.MaxTextLength)
+	text = truncateReviewText(reviewPromptText(text), cfg.Adapter.MaxTextLength)
 	endpoint, err := reviewEndpointForMode(cfg.BaseURL, cfg.Adapter.RequestMode)
 	if err != nil {
 		return ReviewOutcome{Model: cfg.Model}, err
@@ -947,7 +947,7 @@ func (c ReviewClient) reviewInternal(ctx context.Context, endpoint string, paylo
 	if err != nil {
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, err
 	}
-	status, body := exec.ExecuteChatCompletion(ctx, payload, ReviewInternalReason)
+	status, body := exec.ExecuteChatCompletion(ctx, payload, ReviewInternalReason, cfg.Adapter.ReasoningEffort)
 	outcome, decodeErr := decodeReviewResponse(status, "application/json", body, cfg)
 	if decodeErr != nil {
 		completeReviewCircuit(circuitLease, decodeErr)
@@ -1452,6 +1452,36 @@ func decodeChatReviewResponse(body []byte, cfg ReviewConfig) (ReviewOutcome, err
 		IsR18:      parseReviewOptionalBool(decision.IsR18),
 		Model:      model,
 	}, nil
+}
+
+// reviewPromptText strips our own transport envelope before the model sees it.
+//
+// The translation API always sends its texts as a JSON array (["a","b"]), and the
+// review prompt counts "containing a complete JSON body" as a Category 2
+// violation. So the outer brackets alone were enough to block an otherwise
+// innocuous string — the envelope is ours, not the caller's content.
+//
+// Only one level is peeled, and only when the whole input is a JSON array whose
+// every element is a string. A JSON object nested *inside* an element stays
+// verbatim, so a caller genuinely smuggling a payload is still visible.
+func reviewPromptText(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < 2 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
+		return text
+	}
+	var items []any
+	if err := json.Unmarshal([]byte(trimmed), &items); err != nil || len(items) == 0 {
+		return text
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		value, ok := item.(string)
+		if !ok {
+			return text // 不是纯字符串数组：原样交给模型判断
+		}
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, "\n")
 }
 
 // parseReviewOptionalBool accepts a JSON boolean or the strings "true"/"false",
