@@ -517,38 +517,21 @@ type PromptRiskAdaptiveReviewBasis struct {
 }
 
 func (db *DB) GetPromptRiskAdaptiveReviewBasis(ctx context.Context, subjectType, subjectKey string, since time.Time) (PromptRiskAdaptiveReviewBasis, error) {
-	if err := db.ensurePromptRiskEventsTable(ctx); err != nil {
+	// 直接复用授信判定那条查询，不再单独写一份 SQL。
+	//
+	// 之前这里有一份几乎相同的查询，但多带了 is_person=TRUE。api_key 画像的
+	// is_person 是 false，于是面板永远显示「干净复核 0/3」，而后台自动授信走的是
+	// 另一条没有这个过滤的查询 —— 两边不一致，看起来就像授信没生效。
+	summary, err := db.promptRiskTrustEvidenceSummarySince(ctx, subjectType, subjectKey, since)
+	if err != nil {
 		return PromptRiskAdaptiveReviewBasis{}, err
 	}
-	var result PromptRiskAdaptiveReviewBasis
-	var firstClean, lastClean any
-	err := db.conn.QueryRowContext(ctx, `SELECT
-		COUNT(DISTINCT CASE WHEN event_kind='review_cleared' THEN CASE WHEN request_correlation_id<>'' THEN request_correlation_id ELSE source_type || ':' || source_id END END),
-		COALESCE(SUM(CASE WHEN request_risk_score>0 AND event_kind IN ('review_flagged_monitor','local_block_strike','upstream_cy_confirmed_miss','upstream_cy_local_detected','upstream_cy_upstream_only') THEN 1 ELSE 0 END), 0),
-		MIN(CASE WHEN event_kind='review_cleared' THEN created_at ELSE NULL END),
-		MAX(CASE WHEN event_kind='review_cleared' THEN created_at ELSE NULL END)
-	FROM prompt_risk_events
-	WHERE subject_type=$1 AND subject_key=$2 AND is_person=TRUE AND created_at >= $3`,
-		strings.TrimSpace(subjectType), strings.TrimSpace(subjectKey), since.UTC()).Scan(
-		&result.CleanReviewCount, &result.PositiveEvidenceCount, &firstClean, &lastClean)
-	if err != nil {
-		return result, err
-	}
-	if firstClean != nil {
-		value, err := parsePromptRiskTimeValue(firstClean)
-		if err != nil {
-			return result, err
-		}
-		result.FirstCleanAt = &value
-	}
-	if lastClean != nil {
-		value, err := parsePromptRiskTimeValue(lastClean)
-		if err != nil {
-			return result, err
-		}
-		result.LastCleanAt = &value
-	}
-	return result, nil
+	return PromptRiskAdaptiveReviewBasis{
+		CleanReviewCount:      summary.CleanCount,
+		PositiveEvidenceCount: summary.PositiveCount,
+		FirstCleanAt:          summary.FirstCleanAt,
+		LastCleanAt:           summary.LastCleanAt,
+	}, nil
 }
 
 func normalizePromptRiskTrustAdaptiveOptions(options PromptRiskTrustAdaptiveOptions) PromptRiskTrustAdaptiveOptions {

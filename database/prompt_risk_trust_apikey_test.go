@@ -132,3 +132,49 @@ func TestAdaptiveTrustGrantsAPIKeyButNotClientIP(t *testing.T) {
 		t.Fatalf("应当同时存在 api_key 与 client_ip 画像：api_key=%v client_ip=%v", hasAPIKey, hasClientIP)
 	}
 }
+
+// 面板上的「干净复核 N/M」走的是 GetPromptRiskAdaptiveReviewBasis。
+// 它曾经带着 is_person=TRUE，于是 api_key 画像永远显示 0/3 —— 而后台自动授信
+// 走另一条查询，两边不一致，看起来就像授信没生效。
+func TestAdaptiveReviewBasisCountsAPIKeyCleanReviews(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	confidence := 0.1
+
+	for i := 0; i < 4; i++ {
+		input := &PromptFilterLogInput{
+			Source: "local_filter", Endpoint: "/v1/chat/completions", Model: "gpt-6-luna",
+			Action: "allow", ReviewModel: "codex-auto-review", ReviewConfidence: &confidence,
+			ReviewReason: "正常翻译", APIKeyID: 37, APIKeyName: "shaft-65550035", ClientIP: "203.0.113.9",
+			ClientIPHash: promptRiskHash("client-ip", "203.0.113.9"),
+			RequestCorrelationID: fmt.Sprintf("corr-basis-%d", i), TextPreview: fmt.Sprintf("t-%d", i),
+		}
+		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
+			t.Fatalf("InsertPromptFilterLog: %v", err)
+		}
+	}
+
+	since := time.Now().UTC().Add(-time.Hour)
+	basis, err := db.GetPromptRiskAdaptiveReviewBasis(ctx, PromptRiskSubjectAPIKey, "37", since)
+	if err != nil {
+		t.Fatalf("GetPromptRiskAdaptiveReviewBasis: %v", err)
+	}
+	if basis.CleanReviewCount != 4 {
+		t.Fatalf("api_key 干净复核数 = %d, want 4（is_person 过滤会让它恒为 0）", basis.CleanReviewCount)
+	}
+	if basis.PositiveEvidenceCount != 0 {
+		t.Fatalf("正面证据数 = %d, want 0", basis.PositiveEvidenceCount)
+	}
+	if basis.FirstCleanAt == nil || basis.LastCleanAt == nil {
+		t.Fatalf("起止时间没算出来: %+v", basis)
+	}
+
+	// 面板和后台授信必须看到同一个数字——否则又会「后台说该授信、面板说 0/3」。
+	summary, err := db.promptRiskTrustEvidenceSummarySince(ctx, PromptRiskSubjectAPIKey, "37", since)
+	if err != nil {
+		t.Fatalf("promptRiskTrustEvidenceSummarySince: %v", err)
+	}
+	if summary.CleanCount != basis.CleanReviewCount {
+		t.Fatalf("两条查询不一致：面板 %d，授信 %d", basis.CleanReviewCount, summary.CleanCount)
+	}
+}
