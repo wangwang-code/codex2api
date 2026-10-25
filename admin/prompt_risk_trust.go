@@ -79,8 +79,10 @@ func (h *Handler) refreshPromptRiskTrustSnapshot(ctx context.Context) error {
 func (h *Handler) UpsertPromptRiskTrustPolicy(c *gin.Context) {
 	subjectType := strings.TrimSpace(c.Param("subject_type"))
 	subjectKey := strings.TrimSpace(c.Param("subject_key"))
-	if subjectType != database.PromptRiskSubjectNewAPIUser || subjectKey == "" {
-		writeError(c, http.StatusBadRequest, "仅已签名的人员画像可启用自适应可信策略")
+	// 只对「一个人」这个粒度开放：按用户发的密钥（shaft-{uid}）或已签名身份。
+	// 按出口 IP 授信会让同 IP 的所有人一起跳过复核，所以这里直接拒绝。
+	if !database.PromptRiskTrustAdaptiveSubjectEligible(subjectType) || subjectKey == "" {
+		writeError(c, http.StatusBadRequest, "仅 API Key 与已签名身份画像可启用自适应可信策略（出口 IP 不可）")
 		return
 	}
 	var req promptRiskTrustPolicyRequest

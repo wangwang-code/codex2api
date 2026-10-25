@@ -4519,6 +4519,16 @@ function promptRiskFreezeClass(profile: PromptRiskProfile): PromptRiskFreezeClas
   return 'conversation'
 }
 
+// 低风险自适应降频只对「一个人」这个粒度开放：按用户发的密钥（shaft-{uid}）与
+// 已签名身份。client_ip 不在其中——一个出口 IP 后面可能是几十个互不相关的人，
+// 按 IP 授信等于让一个人的干净历史给同 IP 的所有人开绿灯。
+function promptRiskTrustSubjectEligible(profile: PromptRiskProfile) {
+  return (
+    profile.subject_type === 'api_key' ||
+    (profile.subject_type === 'newapi_user' && profile.is_person)
+  )
+}
+
 function promptRiskIdentityKind(profile: PromptRiskProfile) {
   if (profile.subject_type === 'newapi_user') return profile.is_person ? 'newapi_user' : 'unverified_user'
   return profile.subject_type
@@ -4681,9 +4691,9 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
                 <div className="flex flex-wrap items-center gap-2 font-semibold"><Shield className="size-4" />{t('promptFilter.risk.trust.title')}{item.trust_policy ? <Badge variant={item.trust_policy.status === 'active' ? 'default' : 'outline'}>{t(`promptFilter.risk.trust.status.${item.trust_policy.status}`, { defaultValue: item.trust_policy.status })}</Badge> : null}</div>
                 <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">{t('promptFilter.risk.trust.description')}</p>
               </div>
-              {item.is_person ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={() => { setTrustDraft({ durationHours: 24, riskThreshold: item.trust_policy?.risk_threshold ?? 35, reason: item.trust_policy?.reason ?? '' }); setTrustOpen(true) }}>{item.trust_policy?.status === 'active' ? t('promptFilter.risk.trust.adjust') : t('promptFilter.risk.trust.enable')}</Button>{item.trust_policy?.status === 'active' ? <Button size="sm" variant="destructive" disabled={trustSaving} onClick={() => void revokeTrust()}>{t('promptFilter.risk.trust.revoke')}</Button> : null}</div> : null}
+              {promptRiskTrustSubjectEligible(item) ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={() => { setTrustDraft({ durationHours: 24, riskThreshold: item.trust_policy?.risk_threshold ?? 35, reason: item.trust_policy?.reason ?? '' }); setTrustOpen(true) }}>{item.trust_policy?.status === 'active' ? t('promptFilter.risk.trust.adjust') : t('promptFilter.risk.trust.enable')}</Button>{item.trust_policy?.status === 'active' ? <Button size="sm" variant="destructive" disabled={trustSaving} onClick={() => void revokeTrust()}>{t('promptFilter.risk.trust.revoke')}</Button> : null}</div> : null}
             </div>
-            {item.trust_policy ? <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.trust.source')} value={t(`promptFilter.risk.trust.sources.${item.trust_policy.source || 'manual'}`)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.validUntil')} value={formatBeijingTime(item.trust_policy.valid_until)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.threshold')} value={String(item.trust_policy.risk_threshold)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.bypassCount')} value={String(item.trust_policy.bypass_count)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.modelReviewCount')} value={String(item.trust_policy.model_review_count ?? 0)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.lastModelReview')} value={item.trust_policy.last_model_review_at ? formatBeijingTime(item.trust_policy.last_model_review_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.lastEvaluation')} value={item.trust_policy.last_evaluated_at ? `${item.trust_policy.last_risk_score} · ${formatBeijingTime(item.trust_policy.last_evaluated_at)}` : '-'} /></div> : <p className="mt-3 text-xs text-muted-foreground">{item.is_person ? t('promptFilter.risk.trust.notEnabled') : t('promptFilter.risk.trust.personOnly')}</p>}
+            {item.trust_policy ? <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.trust.source')} value={t(`promptFilter.risk.trust.sources.${item.trust_policy.source || 'manual'}`)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.validUntil')} value={formatBeijingTime(item.trust_policy.valid_until)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.threshold')} value={String(item.trust_policy.risk_threshold)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.bypassCount')} value={String(item.trust_policy.bypass_count)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.modelReviewCount')} value={String(item.trust_policy.model_review_count ?? 0)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.lastModelReview')} value={item.trust_policy.last_model_review_at ? formatBeijingTime(item.trust_policy.last_model_review_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.lastEvaluation')} value={item.trust_policy.last_evaluated_at ? `${item.trust_policy.last_risk_score} · ${formatBeijingTime(item.trust_policy.last_evaluated_at)}` : '-'} /></div> : <p className="mt-3 text-xs text-muted-foreground">{promptRiskTrustSubjectEligible(item) ? t('promptFilter.risk.trust.notEnabled') : t('promptFilter.risk.trust.personOnly')}</p>}
           </div>
           {detail?.adaptive_review_basis ? <div className="rounded-lg border border-[hsl(var(--info))]/25 bg-[hsl(var(--info-bg))] p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">

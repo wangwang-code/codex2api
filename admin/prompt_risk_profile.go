@@ -187,12 +187,14 @@ func buildPromptRiskAdaptiveReviewBasis(profile *database.PromptRiskProfile, bas
 	if basis.FirstCleanAt != nil && now.After(*basis.FirstCleanAt) {
 		result.ObservationHours = int(now.Sub(*basis.FirstCleanAt).Hours())
 	}
-	result.Eligible = reviewEnabled && adaptive.Enabled && profile.IsPerson &&
+	eligibleSubject := database.PromptRiskTrustAdaptiveSubjectEligible(profile.SubjectType) &&
+		(profile.SubjectType != database.PromptRiskSubjectNewAPIUser || profile.IsPerson)
+	result.Eligible = reviewEnabled && adaptive.Enabled && eligibleSubject &&
 		basis.CleanReviewCount >= adaptive.MinCleanReviews && basis.PositiveEvidenceCount == 0 &&
 		result.ObservationHours >= adaptive.MinObservationHours && profile.RiskScore < 15 && profile.RiskLevel == database.PromptRiskLevelLow
 	if !reviewEnabled || !adaptive.Enabled {
 		result.Decision = "disabled"
-	} else if !profile.IsPerson {
+	} else if !eligibleSubject {
 		result.Decision = "not_person"
 	} else if profile.TrustPolicy != nil && profile.TrustPolicy.Status == database.PromptRiskTrustStatusActive {
 		result.Decision = "adaptive_active"

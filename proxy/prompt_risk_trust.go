@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/crc32"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,17 +26,29 @@ func (h *Handler) promptRiskTrustPolicyForRequest(c *gin.Context) (database.Prom
 	if h == nil || h.store == nil || c == nil {
 		return database.PromptRiskTrustPolicy{}, "", false
 	}
-	raw, ok := c.Get(newAPIIdentityContextKey)
-	if !ok {
-		return database.PromptRiskTrustPolicy{}, "", false
+	now := time.Now().UTC()
+	// 先看签名身份（归属证据最强），再看 API Key。
+	//
+	// 两者都等于「一个人」：签名身份直接是平台用户；API Key 在本部署里是一 uid
+	// 一把（shaft-{uid}），按密钥授信就是按人授信。
+	//
+	// 不看 client_ip：出口 IP 会被几十个互不相关的人共用，按 IP 授信等于让一个人
+	// 的干净历史给同 IP 的所有人开绿灯。
+	if raw, exists := c.Get(newAPIIdentityContextKey); exists {
+		if identity, valid := raw.(verifiedNewAPIIdentityContext); valid {
+			subjectKey := database.PromptRiskNewAPIUserSubjectKey(identity.Platform, identity.Identity.UserID)
+			if policy, found := h.store.GetPromptRiskTrustPolicy(subjectKey, now); found {
+				return policy, subjectKey, true
+			}
+		}
 	}
-	identity, ok := raw.(verifiedNewAPIIdentityContext)
-	if !ok {
-		return database.PromptRiskTrustPolicy{}, "", false
+	if apiKeyID := requestAPIKeyID(c); apiKeyID > 0 {
+		subjectKey := strconv.FormatInt(apiKeyID, 10)
+		if policy, found := h.store.GetPromptRiskTrustPolicy(subjectKey, now); found {
+			return policy, subjectKey, true
+		}
 	}
-	subjectKey := database.PromptRiskNewAPIUserSubjectKey(identity.Platform, identity.Identity.UserID)
-	policy, ok := h.store.GetPromptRiskTrustPolicy(subjectKey, time.Now().UTC())
-	return policy, subjectKey, ok
+	return database.PromptRiskTrustPolicy{}, "", false
 }
 
 func promptRiskTrustCanBypassReview(decision promptfilter.Decision, verdict promptfilter.Verdict, reviewText string) bool {

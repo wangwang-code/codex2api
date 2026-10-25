@@ -3065,7 +3065,7 @@
         "basisFallbackReason": "系统会根据干净复核数量、观察时长、当前风险和周期抽检规则持续评判。",
         "decisions": {
           "disabled": "自适应审核未启用",
-          "not_person": "非可信人员身份",
+          "not_person": "该维度不参与降频（仅 API Key 与签名身份）",
           "adaptive_active": "自适应降频中",
           "suspended": "已恢复完整审核",
           "eligible": "已满足启用条件",
@@ -3073,7 +3073,7 @@
           "unavailable": "判断依据不可用"
         },
         "notEnabled": "当前没有启用临时信任。",
-        "personOnly": "只有经过签名确认的人员画像可以启用临时信任。",
+        "personOnly": "只有按用户发的密钥（shaft-{uid}）与已签名身份可以启用临时信任；出口 IP 共用同一地址的人太多，不参与降频。",
         "history": "模型审核决策与运维记录",
         "operation": "操作",
         "requestAudit": "关联请求审计",

@@ -196,6 +196,24 @@ func (db *DB) ensurePromptRiskTrustTables(ctx context.Context) error {
 	return nil
 }
 
+// PromptRiskTrustAdaptiveSubjectEligible 判断某类画像能不能参与「低风险自适应降频」。
+//
+// 只认两个粒度，它们都等于「一个人」：
+//   - api_key：按用户发的密钥（shaft-{uid}），一把密钥对应一个 uid；
+//   - newapi_user：已签名的平台身份，归属证据比密钥更强。
+//
+// 刻意不含 client_ip：一个出口 IP 后面可能是几十个互不相关的人（CGNAT、家庭宽带、
+// 同一个代理节点），按 IP 授信会让「其中一个人干净」变成「所有同 IP 的人一起跳过
+// 同步复核」——这正是最不该发生的误放。也不含 session（太短命，一次会话干净说明
+// 不了什么）与 upstream_account（那是资源，不是人）。
+func PromptRiskTrustAdaptiveSubjectEligible(subjectType string) bool {
+	switch strings.TrimSpace(subjectType) {
+	case PromptRiskSubjectAPIKey, PromptRiskSubjectNewAPIUser:
+		return true
+	}
+	return false
+}
+
 func normalizePromptRiskTrustInput(input PromptRiskTrustPolicyInput) (PromptRiskTrustPolicyInput, error) {
 	input.SubjectType = strings.TrimSpace(input.SubjectType)
 	input.SubjectKey = strings.TrimSpace(input.SubjectKey)
@@ -207,8 +225,8 @@ func normalizePromptRiskTrustInput(input PromptRiskTrustPolicyInput) (PromptRisk
 	if input.Source != PromptRiskTrustSourceManual && input.Source != PromptRiskTrustSourceAutomatic {
 		return input, errors.New("adaptive trust source is invalid")
 	}
-	if input.SubjectType != PromptRiskSubjectNewAPIUser || input.SubjectKey == "" {
-		return input, errors.New("adaptive trust requires a signed NewAPI person profile")
+	if !PromptRiskTrustAdaptiveSubjectEligible(input.SubjectType) || input.SubjectKey == "" {
+		return input, errors.New("adaptive trust requires an api_key or a signed NewAPI person profile")
 	}
 	if input.RiskThreshold <= 0 {
 		input.RiskThreshold = 35
@@ -565,8 +583,8 @@ func (db *DB) promptRiskTrustEvidenceSummaries(ctx context.Context, since time.T
 		MIN(CASE WHEN event_kind='review_cleared' THEN created_at ELSE NULL END),
 		MAX(CASE WHEN event_kind='review_cleared' THEN created_at ELSE NULL END)
 	FROM prompt_risk_events
-	WHERE subject_type=$1 AND is_person=TRUE AND created_at >= $2
-	GROUP BY subject_type, subject_key`, PromptRiskSubjectNewAPIUser, since.UTC())
+	WHERE subject_type IN ($1,$2) AND created_at >= $3
+	GROUP BY subject_type, subject_key`, PromptRiskSubjectAPIKey, PromptRiskSubjectNewAPIUser, since.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -597,19 +615,19 @@ func (db *DB) promptRiskTrustEvidenceSummaries(ctx context.Context, since time.T
 	return items, rows.Err()
 }
 
-func (db *DB) promptRiskTrustEvidenceSummarySince(ctx context.Context, subjectKey string, since time.Time) (promptRiskTrustEvidenceSummary, error) {
+func (db *DB) promptRiskTrustEvidenceSummarySince(ctx context.Context, subjectType, subjectKey string, since time.Time) (promptRiskTrustEvidenceSummary, error) {
 	if err := db.ensurePromptRiskEventsTable(ctx); err != nil {
 		return promptRiskTrustEvidenceSummary{}, err
 	}
-	item := promptRiskTrustEvidenceSummary{SubjectType: PromptRiskSubjectNewAPIUser, SubjectKey: subjectKey}
+	item := promptRiskTrustEvidenceSummary{SubjectType: subjectType, SubjectKey: subjectKey}
 	var firstClean, lastClean any
 	err := db.conn.QueryRowContext(ctx, `SELECT
 		COUNT(DISTINCT CASE WHEN event_kind='review_cleared' THEN CASE WHEN request_correlation_id<>'' THEN request_correlation_id ELSE source_type || ':' || source_id END END),
 		COALESCE(SUM(CASE WHEN request_risk_score>0 AND event_kind IN ('review_flagged_monitor','local_block_strike','upstream_cy_confirmed_miss','upstream_cy_local_detected','upstream_cy_upstream_only') THEN 1 ELSE 0 END), 0),
 		MIN(CASE WHEN event_kind='review_cleared' THEN created_at ELSE NULL END),
 		MAX(CASE WHEN event_kind='review_cleared' THEN created_at ELSE NULL END)
-	FROM prompt_risk_events WHERE subject_type=$1 AND subject_key=$2 AND is_person=TRUE AND created_at >= $3`,
-		PromptRiskSubjectNewAPIUser, subjectKey, since.UTC()).Scan(&item.CleanCount, &item.PositiveCount, &firstClean, &lastClean)
+	FROM prompt_risk_events WHERE subject_type=$1 AND subject_key=$2 AND created_at >= $3`,
+		subjectType, subjectKey, since.UTC()).Scan(&item.CleanCount, &item.PositiveCount, &firstClean, &lastClean)
 	if err != nil {
 		return item, err
 	}
@@ -652,7 +670,11 @@ func (db *DB) ReconcileAdaptivePromptRiskTrustPolicies(ctx context.Context, raw 
 		if profileErr != nil && !errors.Is(profileErr, sql.ErrNoRows) {
 			return nil, profileErr
 		}
-		if profile == nil || !profile.IsPerson {
+		if profile == nil || !PromptRiskTrustAdaptiveSubjectEligible(profile.SubjectType) {
+			continue
+		}
+		// 签名身份还必须真的是人：身份目录里可能有非人对象。
+		if profile.SubjectType == PromptRiskSubjectNewAPIUser && !profile.IsPerson {
 			continue
 		}
 		if policy != nil && policy.Status == PromptRiskTrustStatusActive {
@@ -668,7 +690,7 @@ func (db *DB) ReconcileAdaptivePromptRiskTrustPolicies(ctx context.Context, raw 
 			if now.Before(policy.UpdatedAt.Add(time.Duration(options.ReactivationCooldownHours) * time.Hour)) {
 				continue
 			}
-			recent, recentErr := db.promptRiskTrustEvidenceSummarySince(ctx, evidence.SubjectKey, policy.UpdatedAt)
+			recent, recentErr := db.promptRiskTrustEvidenceSummarySince(ctx, evidence.SubjectType, evidence.SubjectKey, policy.UpdatedAt)
 			if recentErr != nil {
 				return nil, recentErr
 			}

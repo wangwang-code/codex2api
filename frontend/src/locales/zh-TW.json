@@ -1134,7 +1134,7 @@
         "basisFallbackReason": "系統會依乾淨複核數量、觀察時長、目前風險與週期抽檢規則持續評判。",
         "decisions": {
           "disabled": "自適應審核未啟用",
-          "not_person": "非可信人員身份",
+          "not_person": "該維度不參與降頻（僅 API Key 與簽章身分）",
           "adaptive_active": "自適應降頻中",
           "suspended": "已恢復完整審核",
           "eligible": "已符合啟用條件",
@@ -1142,7 +1142,7 @@
           "unavailable": "判斷依據不可用"
         },
         "notEnabled": "目前未啟用臨時信任。",
-        "personOnly": "只有經簽名確認的人員畫像可啟用臨時信任。",
+        "personOnly": "只有按使用者發的金鑰（shaft-{uid}）與已簽章身分可以啟用臨時信任；出口 IP 共用同一地址的人太多，不參與降頻。",
         "history": "模型審核決策與維運記錄",
         "operation": "操作",
         "requestAudit": "關聯請求稽核",

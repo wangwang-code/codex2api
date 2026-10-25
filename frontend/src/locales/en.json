@@ -3065,7 +3065,7 @@
         "basisFallbackReason": "The system continuously evaluates clean reviews, observation time, current risk, and periodic sampling.",
         "decisions": {
           "disabled": "Adaptive review disabled",
-          "not_person": "Not a verified person",
+          "not_person": "This dimension is not eligible (API keys and signed identities only)",
           "adaptive_active": "Adaptive review reduction active",
           "suspended": "Full model review restored",
           "eligible": "Eligible for adaptive review",
@@ -3073,7 +3073,7 @@
           "unavailable": "Decision basis unavailable"
         },
         "notEnabled": "Temporary trust is not enabled.",
-        "personOnly": "Only signed person profiles can receive temporary trust.",
+        "personOnly": "Only per-user keys (shaft-{uid}) and signed identities can enable temporary trust. An egress IP is shared by too many unrelated people to lower review frequency on.",
         "history": "Model-review decisions and operations",
         "operation": "Operation",
         "requestAudit": "Linked request audit",
