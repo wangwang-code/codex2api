@@ -137,8 +137,33 @@ func ensurePromptPolicyRequestCorrelationID(c *gin.Context) string {
 			return value
 		}
 	}
+	// 调用方自己带了追踪 id 就用它：同一个 id 于是同时出现在调用方的事务账本和
+	// 这里的 prompt_filter_logs 里，两边不必互相复制正文就能对上同一次请求。
+	// 只接受形如 UUID/短 token 的值，避免把任意字符串写进日志表。
+	if inbound := normalizeInboundCorrelationID(c.GetHeader("X-Request-Id")); inbound != "" {
+		c.Set(promptPolicyRequestCorrelationContextKey, inbound)
+		return inbound
+	}
 	value := uuid.NewString()
 	c.Set(promptPolicyRequestCorrelationContextKey, value)
+	return value
+}
+
+// normalizeInboundCorrelationID 只放行 8–64 位的 [A-Za-z0-9._-]。超出范围一律
+// 忽略并回落到自己生成的 UUID —— 关联 id 是外键，不能让它带上奇怪内容。
+func normalizeInboundCorrelationID(raw string) string {
+	value := strings.TrimSpace(raw)
+	if len(value) < 8 || len(value) > 64 {
+		return ""
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return ""
+		}
+	}
 	return value
 }
 

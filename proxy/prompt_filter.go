@@ -50,6 +50,18 @@ func promptBlockedMessage(cfg promptfilter.Config, verdict promptfilter.Verdict)
 // block, which it meters differently.
 const promptFilterR18Header = "X-Prompt-Filter-R18"
 
+// setPromptCorrelationHeader echoes the correlation id actually used for this
+// request, so a caller that did not supply X-Request-Id can still join its own
+// record to prompt_filter_logs without copying the prompt text.
+func setPromptCorrelationHeader(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	if id := ensurePromptPolicyRequestCorrelationID(c); id != "" {
+		c.Header("X-Prompt-Correlation-Id", id)
+	}
+}
+
 func setPromptFilterR18Header(c *gin.Context, verdict promptfilter.Verdict) {
 	if c == nil || verdict.ReviewIsR18 == nil {
 		return
@@ -146,6 +158,7 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	// Header first: writeBlock may replace the body with an endpoint-specific
 	// envelope, and the caller still needs the is_r18 signal.
 	setPromptFilterR18Header(c, verdict)
+	setPromptCorrelationHeader(c)
 	if writeBlock != nil {
 		writeBlock(c, strings.TrimSpace(cfg.Advanced.Enforcement.LocalBlockMessage))
 		return true
@@ -182,6 +195,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 		return true
 	}
 	setPromptFilterR18Header(c, verdict)
+	setPromptCorrelationHeader(c)
 	api.SendErrorWithStatus(c, promptBlockedAPIError(cfg, verdict), http.StatusBadRequest)
 	return true
 }
