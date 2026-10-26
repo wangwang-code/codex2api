@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -126,7 +127,35 @@ func (h *Handler) executeInternalChatWithAttribution(ctx context.Context, body [
 	}
 	applyInternalResponseAttribution(c, req, attribution)
 	h.ChatCompletions(c)
-	return recorder.Code, recorder.Body.Bytes()
+	return internalChatResult(ctx, recorder, c)
+}
+
+// internalChatResult turns the recorder's view of the child request into the
+// (status, body) pair a real client would have seen.
+func internalChatResult(ctx context.Context, recorder *httptest.ResponseRecorder, c *gin.Context) (int, []byte) {
+	status := recorder.Code
+	respBody := recorder.Body.Bytes()
+	if len(bytes.TrimSpace(respBody)) == 0 {
+		// 一个字节都没写出来。走真 HTTP 时下游看到的是「连接被关掉」，可
+		// httptest.ResponseRecorder 的默认状态码是 200 —— 把 (200, 空) 原样
+		// 交给复核方，它只会把空串当 JSON 解析，报成
+		// 「invalid review model JSON: unexpected end of JSON input」，
+		// 于是一次超时被记成了「模型返回了坏 JSON」：不重试、不计熔断失败、
+		// 每次还照样烧满整个复核预算。
+		if err := ctx.Err(); err != nil {
+			status = http.StatusGatewayTimeout
+			if errors.Is(err, context.Canceled) {
+				status = logStatusClientClosed
+			}
+			respBody = []byte(`{"error":{"message":"internal chat request aborted: ` +
+				err.Error() + `","type":"upstream_error","code":"internal_request_aborted"}}`)
+		} else if override, ok := c.Get(AccessLogStatusContextKey); ok {
+			if code, ok := override.(int); ok && code >= 400 {
+				status = code
+			}
+		}
+	}
+	return status, respBody
 }
 
 // InternalChatExecutor adapts the handler to promptfilter.InternalExecutor. It

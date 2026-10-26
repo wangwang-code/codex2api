@@ -918,6 +918,13 @@ func decodeReviewResponse(status int, contentType string, body []byte, cfg Revie
 			summary:     summarizeReviewHTTPBody(contentType, body),
 		}
 	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		// 2xx 但零字节。以前这会被当成 JSON 解析失败，报成「模型返回了坏
+		// JSON」——而真相是这次复核根本没拿到响应（超时、上下文取消、
+		// 上游断流后重试耗尽）。两者要分开：坏 JSON 说明模型不听话，空响应
+		// 说明链路没走通。
+		return ReviewOutcome{}, fmt.Errorf("review response body is empty (status %d, content-type %q)", status, contentType)
+	}
 	var (
 		outcome ReviewOutcome
 		err     error
@@ -1427,7 +1434,11 @@ func decodeChatReviewResponse(body []byte, cfg ReviewConfig) (ReviewOutcome, err
 	}
 	var decision chatReviewDecision
 	if err := json.Unmarshal(extractReviewJSONObject(content), &decision); err != nil {
-		return ReviewOutcome{}, fmt.Errorf("invalid review model JSON: %w", err)
+		// 把模型真正说的内容带进错误里。只报「unexpected end of JSON input」
+		// 时，没人分得清是空回复、截断、还是夹了自然语言——而这三者的处理
+		// 完全不同。预览经过脱敏和截断，会随 review_error 落到审计面板。
+		return ReviewOutcome{}, fmt.Errorf("invalid review model JSON: %w (content %d chars: %s)",
+			err, utf8.RuneCountInString(content), RedactedPreview(content, 240))
 	}
 	confidence, hasConfidence, err := parseReviewConfidence(decision.Confidence)
 	if err != nil {
