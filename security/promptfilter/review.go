@@ -813,6 +813,33 @@ func ReviewKeyPoolStatus(cfg ReviewConfig) ReviewKeyPoolHealth {
 	return result
 }
 
+// reviewCircuitUnavailableError 表示这次复核**根本没发出去**：熔断器还开着，
+// 或者恢复探针正在进行。
+//
+// 它和「复核失败」是两件事，审计必须分开：没有请求、没有延迟、也没有上游参与。
+// 记成「已复核」会让复核历史里出现一条并不存在的记录，也让复核覆盖率虚高；
+// 记成「失败」则把一次全局跳过算到某个具体请求头上，看着像这条请求出了问题。
+type reviewCircuitUnavailableError struct {
+	probe      bool
+	retryAfter time.Duration
+}
+
+func (e *reviewCircuitUnavailableError) Error() string {
+	if e == nil {
+		return "review circuit breaker is unavailable"
+	}
+	if e.probe {
+		return "review circuit breaker is half-open; recovery probe in progress"
+	}
+	return fmt.Sprintf("review circuit breaker is open; retry after %s", e.retryAfter.Round(time.Second))
+}
+
+// IsReviewCircuitUnavailable 报告错误是否只是「熔断器拒绝了这次复核」。
+func IsReviewCircuitUnavailable(err error) bool {
+	var target *reviewCircuitUnavailableError
+	return errors.As(err, &target)
+}
+
 func acquireReviewCircuit(endpoint, model string, cfg ReviewAdapterConfig) (*reviewCircuitLease, error) {
 	cfg = NormalizeReviewAdapterConfig(cfg)
 	value, _ := reviewCircuitBreakers.LoadOrStore(reviewCircuitKey(endpoint, model), &reviewCircuitBreaker{})
@@ -830,10 +857,10 @@ func acquireReviewCircuit(endpoint, model string, cfg ReviewAdapterConfig) (*rev
 		return lease, nil
 	}
 	if now.Before(state.openUntil) {
-		return nil, fmt.Errorf("review circuit breaker is open; retry after %s", time.Until(state.openUntil).Round(time.Second))
+		return nil, &reviewCircuitUnavailableError{retryAfter: time.Until(state.openUntil)}
 	}
 	if state.probing {
-		return nil, fmt.Errorf("review circuit breaker is half-open; recovery probe in progress")
+		return nil, &reviewCircuitUnavailableError{probe: true}
 	}
 	state.probing = true
 	lease.probe = true
@@ -998,17 +1025,25 @@ func ApplyReviewOutcome(verdict Verdict, outcome ReviewOutcome, reviewErr error,
 	verdict.ReviewIsR18 = outcome.IsR18
 	if reviewErr != nil {
 		verdict.ReviewError = reviewErr.Error()
+		// 熔断器拒绝时复核没有发生，不能记成「已复核」——否则复核历史里会多出
+		// 一条 latency=0 的记录，看起来像审过了，其实是整段窗口都没审。
+		circuitSkipped := IsReviewCircuitUnavailable(reviewErr)
+		verdict.Reviewed = !circuitSkipped
+		prefix := "prompt review failed"
+		if circuitSkipped {
+			prefix = "prompt review skipped (reviewer circuit open)"
+		}
 		if cfg.FailClosed {
 			verdict.Action = ActionBlock
-			verdict.Reason = "prompt review failed: " + reviewErr.Error()
+			verdict.Reason = prefix + ": " + reviewErr.Error()
 		} else if localAction != ActionAllow {
 			// Fail-open controls only the unavailable external reviewer. It must
 			// not erase an independently reached local warn/block decision.
 			verdict.Action = localAction
-			verdict.Reason = "prompt review failed; retained local filter decision: " + reviewErr.Error()
+			verdict.Reason = prefix + "; retained local filter decision: " + reviewErr.Error()
 		} else {
 			verdict.Action = ActionAllow
-			verdict.Reason = "prompt review failed; allowed by policy: " + reviewErr.Error()
+			verdict.Reason = prefix + "; allowed by policy: " + reviewErr.Error()
 		}
 		return verdict
 	}
