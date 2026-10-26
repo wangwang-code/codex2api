@@ -5082,18 +5082,24 @@ func (h *Handler) Responses(c *gin.Context) {
 			if continuousRetryBufferedAttemptCommitted(continuousRetryPolicy, outcome) {
 				h.store.BindSessionAffinityWithGuard(affinityKey, account, proxyURL, affinityGuard)
 			}
-			// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
-			outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
+			// 上游错误消息改写：只作用于下面这些「发给下游」的分支。
+			// outcome.failureMessage 本身保持原样 —— 用量日志、诊断日志和过载熔断都要靠它
+			// 保留真实原因（下游取消 499 / 断流 598 / 流预算 / 首字超时 / 上游过载）。
+			clientMessage, clientRewritten := outcome.clientFailureText()
+			if clientRewritten {
+				// 这条 message 是配置话术，不是上游原话，显式标出去。
+				c.Header(upstreamErrorRewrittenHeader, "1")
+			}
 			if isStream && outcome.terminalLocal {
 				writeContinuousRetryLocalResponsesError(c)
 			} else if isStream && abortedForHTTPError && !downstreamWrote {
 				// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 				// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 				// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
-				if !writeCommittedResponsesRetryError(c, outcome.failureMessage) {
+				if !writeCommittedResponsesRetryError(c, clientMessage) {
 					c.Header("Content-Type", "application/json; charset=utf-8")
 					c.JSON(outcome.logStatusCode, gin.H{
-						"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+						"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": "upstream_error"},
 					})
 				}
 			} else if isStream && !downstreamWrote && outcome.logStatusCode == logStatusUpstreamStreamBreak &&
@@ -5101,21 +5107,21 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 首包前断流/首字超时且重试耗尽：原先没有任何写出分支命中，下游
 				// 收到空 body 的"假 200"，失败完全不可感知 (issue #473)。598 是内部
 				// 日志状态，对外按真实 502 + 稳定错误码返回，下游可编程识别并重试。
-				if !writeCommittedResponsesRetryError(c, outcome.failureMessage) {
+				if !writeCommittedResponsesRetryError(c, clientMessage) {
 					c.Header("Content-Type", "application/json; charset=utf-8")
 					c.JSON(http.StatusBadGateway, gin.H{
-						"error": gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
+						"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
 					})
 				}
 			}
 			if !isStream && nonStreamFailure != nil && readErr == nil {
 				status := safeGrokNativeHTTPStatus(outcome.logStatusCode)
-				if !writeCommittedResponsesRetryError(c, outcome.failureMessage) {
+				if !writeCommittedResponsesRetryError(c, clientMessage) {
 					if len(nonStreamResponseBody) > 0 && gjson.ValidBytes(nonStreamResponseBody) {
 						c.Data(status, nonStreamContentType, nonStreamResponseBody)
 					} else {
 						c.JSON(status, gin.H{
-							"error": gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError},
+							"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": ErrorTypeUpstreamError},
 						})
 					}
 				}
@@ -5992,18 +5998,24 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 
-		// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
-		outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
+		// 上游错误消息改写：只作用于下面这些「发给下游」的分支。
+		// outcome.failureMessage 本身保持原样 —— 用量日志、诊断日志和过载熔断都要靠它
+		// 保留真实原因（下游取消 499 / 断流 598 / 流预算 / 首字超时 / 上游过载）。
+		clientMessage, clientRewritten := outcome.clientFailureText()
+		if clientRewritten {
+			// 这条 message 是配置话术，不是上游原话，显式标出去。
+			c.Header(upstreamErrorRewrittenHeader, "1")
+		}
 		if isStream && outcome.terminalLocal {
 			writeContinuousRetryLocalResponsesError(c)
 		} else if isStream && abortedForHTTPError && !downstreamWrote {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
-			if !writeCommittedResponsesRetryError(c, outcome.failureMessage) {
+			if !writeCommittedResponsesRetryError(c, clientMessage) {
 				c.Header("Content-Type", "application/json; charset=utf-8")
 				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": "upstream_error"},
 				})
 			}
 		} else if isStream && !downstreamWrote && logStatusCode == logStatusUpstreamStreamBreak &&
@@ -6011,10 +6023,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 首包前断流/首字超时且重试耗尽：原先没有任何写出分支命中，下游
 			// 收到空 body 的"假 200"，失败完全不可感知 (issue #473)。598 是内部
 			// 日志状态，对外按真实 502 + 稳定错误码返回，下游可编程识别并重试。
-			if !writeCommittedResponsesRetryError(c, outcome.failureMessage) {
+			if !writeCommittedResponsesRetryError(c, clientMessage) {
 				c.Header("Content-Type", "application/json; charset=utf-8")
 				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
 				})
 			}
 		} else if !isStream {
@@ -6022,7 +6034,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				// The deadline owns the terminal response.
 			} else if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": "upstream_error"},
 				})
 			} else if responseJSON != nil {
 				c.Header("Content-Type", "application/json")
@@ -8063,11 +8075,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 			}
 		}
-		// 上游错误消息改写：命中配置状态码时，下面所有分支只暴露配置文案。
-		// 流预算中止是本地请求级失败、不是上游错误，按 CPA 的语义跳过改写——否则
-		// 用量页会显示成「上游服务不可用」，把真实中止原因（输出失控）盖掉。
-		if !streamLimitBreached {
-			outcome.failureMessage = rewriteUpstreamErrorText(outcome.logStatusCode, outcome.failureMessage)
+		// 上游错误消息改写：只作用于下面这些「发给下游」的分支。
+		// outcome.failureMessage 本身保持原样 —— 用量日志、诊断日志和过载熔断都要靠它
+		// 保留真实原因（下游取消 499 / 断流 598 / 流预算 / 首字超时 / 上游过载）。
+		clientMessage, clientRewritten := outcome.clientFailureText()
+		if clientRewritten {
+			// 这条 message 是配置话术，不是上游原话，显式标出去。
+			c.Header(upstreamErrorRewrittenHeader, "1")
 		}
 		if streamLimitBreached {
 			// 流预算中止：固定 payload（已提交流走 SSE 错误帧），不换号重试。
@@ -8078,10 +8092,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
-			if !writeCommittedChatRetryError(c, outcome.failureMessage) {
+			if !writeCommittedChatRetryError(c, clientMessage) {
 				c.Header("Content-Type", "application/json; charset=utf-8")
 				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": "upstream_error"},
 				})
 			}
 		} else if isStream && !downstreamWrote && logStatusCode == logStatusUpstreamStreamBreak &&
@@ -8089,10 +8103,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 首包前断流/首字超时且重试耗尽：原先没有任何写出分支命中，下游
 			// 收到空 body 的"假 200"，失败完全不可感知 (issue #473)。598 是内部
 			// 日志状态，对外按真实 502 + 稳定错误码返回，下游可编程识别并重试。
-			if !writeCommittedChatRetryError(c, outcome.failureMessage) {
+			if !writeCommittedChatRetryError(c, clientMessage) {
 				c.Header("Content-Type", "application/json; charset=utf-8")
 				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
 				})
 			}
 		} else if !isStream {
@@ -8100,7 +8114,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				// The deadline owns the terminal response.
 			} else if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": "upstream_error"},
 				})
 			} else if isStreamStallOutcome(outcome) {
 				// 非流式遇到停顿中止时必须报错：compactResult 是「读完流就构建」的，
@@ -8108,7 +8122,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				// 而调用方（翻译类 App）没有任何可编程信号能发现被截断。
 				c.Header("Content-Type", "application/json; charset=utf-8")
 				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
+					"error": gin.H{"message": clientMessage, "rewritten": clientRewritten, "type": ErrorTypeUpstreamError, "code": ErrorCodeUpstreamStreamBreak},
 				})
 			} else if compactResult != nil {
 				c.Data(http.StatusOK, "application/json", compactResult)

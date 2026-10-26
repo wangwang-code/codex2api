@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 上游错误消息改写（迁移自 CPA 的 error-rewrite 补丁）。
@@ -136,6 +138,42 @@ func rewriteUpstreamErrorText(status int, message string) string {
 		return rewritten
 	}
 	return message
+}
+
+// upstreamErrorRewrittenHeader 标记本次响应里的错误文案是配置话术、不是上游原话。
+const upstreamErrorRewrittenHeader = "X-Upstream-Error-Rewritten"
+
+// markRewrittenClientError 在响应头标注「这条错误文案是按配置改写的」。
+// 供没有 streamOutcome 的调用点使用（如 /v1/messages 路径）。
+func markRewrittenClientError(c *gin.Context, status int) {
+	if c == nil {
+		return
+	}
+	if _, ok := upstreamErrorRewriteMessage(status); ok {
+		c.Header(upstreamErrorRewrittenHeader, "1")
+	}
+}
+
+// clientFailureText 返回发给下游的失败文案，以及它是否被改写。
+//
+// failureMessage 与它的分工是这次修复的重点：failureMessage 永远保留真实原因，
+// 用量日志、诊断日志和过载熔断都依赖它；对外文案在这里单独派生。之前是把
+// rewriteUpstreamErrorText 的返回值写回 failureMessage 本身，于是日志跟着被改写，
+// 线上表现是：下游取消（499）、网关合成的断流（598）、流预算中止、首字超时
+// 全部记成「[云翻译]上游服务暂时不可用」——用量页再也分不清到底是哪一种，
+// 而过载熔断靠 error_message 里找 server_is_overloaded，字面量被盖掉后永不触发。
+//
+// 客户端侧行为不变：仍然是命中配置就给配置文案，别让上游的 error body 漏出去。
+//
+// 改写过的文案必须能被认出来。下游拿到「[云翻译]上游服务暂时不可用」时无从判断
+// 这是上游真实原因、还是网关为了不漏上游身份而换掉的说法——两者的处置完全不同：
+// 前者该退避重试，后者可能只是本地预算中止或下游自己取消。所以调用方要把这个
+// bool 显式标给下游（响应头 + error.rewritten），而不是让固定话术冒充上游原话。
+func (o streamOutcome) clientFailureText() (string, bool) {
+	if rewritten, ok := upstreamErrorRewriteMessage(o.logStatusCode); ok {
+		return rewritten, true
+	}
+	return o.failureMessage, false
 }
 
 // upstreamClientErrorMessage 把上游错误体转成可直接发给客户端的文案，并套用改写。

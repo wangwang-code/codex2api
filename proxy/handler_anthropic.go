@@ -1237,6 +1237,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				return
 			}
 			errType := mapHTTPStatusToAnthropicError(resp.StatusCode)
+			markRewrittenClientError(c, resp.StatusCode)
 			msg := upstreamClientErrorMessage(resp.StatusCode, errBody)
 			if msg == "" || msg == fmt.Sprintf("HTTP %d", resp.StatusCode) {
 				msg = fmt.Sprintf("Upstream returned status %d", resp.StatusCode)
