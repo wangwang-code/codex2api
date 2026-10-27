@@ -97,6 +97,16 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 		if errors.As(err, &opErr) && opErr.Op == "dial" {
 			return nil, nil, fmt.Errorf("刷新连接失败: %w", err)
 		}
+		// 连接层面就没拿到回应：EOF、TLS 握手失败、连接被重置、超时。
+		//
+		// 以前这类失败被归成「结果未确认」，代价是：一次网络抖动就让
+		// FailCodexRefresh 把这次刷新挂成未确认，账号从此不再用这把 RT，
+		// 要求重新授权并导入凭据。而它想防的「服务端已经轮换、旧 RT 已失效」，
+		// 会在下一次刷新时以 invalid_grant 明确回答 —— 不需要靠猜，更不该由
+		// 一次 EOF 来判。
+		if isOAuthRefreshTransportFailure(err) {
+			return nil, nil, fmt.Errorf("刷新请求失败（网络）: %w", err)
+		}
 		return nil, nil, &oauthRefreshUncertainError{fmt.Errorf("刷新请求结果未知: %w", err)}
 	}
 	defer resp.Body.Close()
@@ -336,6 +346,44 @@ type oauthRefreshUncertainError struct{ err error }
 
 func (e *oauthRefreshUncertainError) Error() string { return e.err.Error() }
 func (e *oauthRefreshUncertainError) Unwrap() error { return e.err }
+
+// isOAuthRefreshTransportFailure 判断这次刷新失败是不是「连接层面没拿到回应」。
+//
+// 判据是「有没有收到 HTTP 响应」，不是「错误看起来严不严重」。client.Do 返回
+// 错误就意味着一个响应字节都没收到 —— EOF、TLS 握手失败、x509 校验失败、连接被
+// 重置、拨号超时，全在这一类里。
+//
+// 与之相对，200 但响应体读不完整或解析不出来，才是**真的**未确认：服务端显然已经
+// 处理过这次刷新，可能已经把 RT 轮换掉了。那种情况仍然走 oauthRefreshUncertainError。
+func isOAuthRefreshTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// 调用方自己的 ctx 到期或取消：请求没走完，与服务端状态无关。
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// *url.Error 实现了 net.Error，所以 client.Do 的错误基本都落在这里，
+	// TLS 与 x509 失败也被包在 url.Error 里面。
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// 自定义 RoundTripper 或包装过的错误不一定满足 net.Error，按文案兜底。
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"tls:", "remote error:", "handshake", "connection reset", "connection refused",
+		"broken pipe", "unexpected eof", "server closed", "stream error", "i/o timeout",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
 
 func isOAuthRefreshUncertain(err error) bool {
 	var uncertain *oauthRefreshUncertainError
